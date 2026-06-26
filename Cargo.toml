@@ -1,0 +1,17 @@
+[package]
+name = "canva-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+canvas_core = { path = "../../canva" }
+eframe = { version = "0.34", features = ["wgpu"] }
+egui = "0.34"
+pollster = "0.4"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
