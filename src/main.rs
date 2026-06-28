@@ -1,28 +1,18 @@
-﻿use canvas_core::{
+use canvas_core::{
     AppendStrokeCommand, BeginStrokeCommand, BlendMode, BrushDynamics, BrushMode, BrushStamp,
-    BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore, Color,
-    CommandOutput, InputDeviceCapabilities, LayerGroupMode, LayerId, LayerSnapshot, LayerSpec,
-    PressureCurve, SelectedPixels, SelectionCombineMode, SelectionPoint, SelectionPolygon,
-    SelectionRect, StabilizerConfig, StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig,
+    BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore, CanvasError,
+    CaptureLevel, Color, CommandOutput, DataCaptureConfig, InputDeviceCapabilities, LayerGroupMode,
+    LayerId, LayerSnapshot, LayerSpec, PressureCurve, SelectedPixels, SelectionCombineMode,
+    SelectionPoint, SelectionPolygon, SelectionRect, SessionTrace, StabilizerConfig,
+    StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig, TraceReport,
 };
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 
 fn main() -> eframe::Result<()> {
-    // Headless verification shortcut for the one-shot defect test (same code the
-    // in-app button runs). Usage: `cargo run -- --repro`.
-    if std::env::args().any(|arg| arg == "--repro") {
-        match run_undo_replay_defect_repro() {
-            Ok((reproduced, log)) => {
-                println!("{log}\n\n[reproduced = {reproduced}]");
-            }
-            Err(error) => eprintln!("repro error: {error}"),
-        }
-        return Ok(());
-    }
-
     let config = CanvasConfig {
         width: 1024,
         height: 1024,
@@ -41,16 +31,16 @@ fn main() -> eframe::Result<()> {
             max_distance: 12.0,
             min_samples: 2,
         },
+        data_capture: initial_capture_config(),
         ..CanvasConfig::default()
     };
 
-    let mut core = pollster::block_on(CanvasCore::new(config)).expect("鍒涘缓 CanvasCore 澶辫触");
+    let mut core = pollster::block_on(CanvasCore::new(config)).expect("创建 CanvasCore 失败");
 
     let layer_id = LayerId(1);
     core.execute(&CanvasCommand::AddLayer(LayerSpec::new(layer_id)))
-        .expect("娣诲姞鍥惧眰澶辫触");
-    core.execute(&CanvasCommand::Composite)
-        .expect("鍚堟垚鐢诲竷澶辫触");
+        .expect("添加图层失败");
+    core.composite().expect("合成画布失败");
 
     // Clone wgpu resources so eframe shares the same device/queue as the engine.
     // This enables zero-copy GPU texture interop without CPU readback.
@@ -64,7 +54,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 900.0])
-            .with_title("鐢诲竷寮曟搸娴嬭瘯"),
+            .with_title("画布引擎测试"),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::Existing(
                 eframe::egui_wgpu::WgpuSetupExisting {
@@ -80,155 +70,10 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "鐢诲竷寮曟搸娴嬭瘯",
+        "画布引擎测试",
         options,
         Box::new(|cc| Ok(Box::new(CanvasApp::new(core, layer_id, cc)))),
     )
-}
-
-// ==========================================================================
-// Repro: undo_by_gpu_replay must not destroy pixels on other layers.
-// Scenario: layer 1 paints region A, layer 2 paints region B.
-// Reordering layers invalidates the replay log without touching resident pixels.
-// A later brush on layer 2 leaves the retained log with only that brush.
-// undo_by_gpu_replay(1) should match regular undo and keep layer 1 pixels.
-// The reveal step paints green below region A; preserved red means layer 1 survived.
-// ============================================================================
-const REPRO_A_X: usize = 42;
-const REPRO_A_Y: usize = 40;
-const REPRO_W: u32 = 128;
-const REPRO_H: u32 = 128;
-const REPRO_TILE: u32 = 32;
-
-fn repro_config() -> CanvasConfig {
-    CanvasConfig {
-        width: REPRO_W,
-        height: REPRO_H,
-        tile_size: REPRO_TILE,
-        ..CanvasConfig::default()
-    }
-}
-
-fn repro_paint(layer: u64, x: f32, y: f32, color: Color) -> canvas_core::BrushCommand {
-    canvas_core::BrushCommand {
-        layer: LayerId(layer),
-        mode: BrushMode::Paint,
-        points: vec![
-            StrokePoint {
-                x,
-                y,
-                pressure: 1.0,
-            },
-            StrokePoint {
-                x: x + 4.0,
-                y,
-                pressure: 1.0,
-            },
-        ],
-        radius: 8.0,
-        color,
-    }
-}
-
-fn repro_a_index() -> usize {
-    REPRO_A_Y * REPRO_W as usize + REPRO_A_X
-}
-
-fn repro_layer1_tiles(core: &CanvasCore) -> usize {
-    core.layer_snapshot()
-        .iter()
-        .find(|s| s.spec.id.0 == 1)
-        .map_or(0, |s| s.tile_count)
-}
-
-// live paint helper
-fn live_paint(layer: u64, x: f32, y: f32, radius: f32, color: Color) -> canvas_core::BrushCommand {
-    canvas_core::BrushCommand {
-        layer: LayerId(layer),
-        mode: BrushMode::Paint,
-        points: vec![StrokePoint {
-            x,
-            y,
-            pressure: 1.0,
-        }],
-        radius,
-        color,
-    }
-}
-
-async fn repro_build(core: &mut CanvasCore) -> Result<f32, canvas_core::CanvasError> {
-    core.add_layer(LayerSpec::new(LayerId(1))); // 闁告瑦顨呴濠囧炊閹呮勾 -> 闁告牕鎼悡姗?    core.add_layer(LayerSpec::new(LayerId(2))); // 婵炶尪顕ф慨鈺呭炊閹呮勾 -> 闁告牕鎼悡姗?    core.apply_brush(&repro_paint(1, 40.0, 40.0, Color::rgba(1.0, 0.0, 0.0, 1.0)))?;
-    core.apply_brush(&repro_paint(2, 96.0, 96.0, Color::rgba(0.0, 1.0, 0.0, 1.0)))?;
-    let _handle = core.composite()?;
-    let before = core.debug_readback().await?.rgba_f32[repro_a_index()][3];
-    // Invalidate replay by moving layer 2 without touching pixels.
-    core.move_layer(LayerId(2), 0)?;
-    // Paint another stroke on layer 2; layer 1 is no longer in replay log.
-    core.apply_brush(&repro_paint(2, 96.0, 70.0, Color::rgba(0.0, 1.0, 0.0, 1.0)))?;
-    let _handle = core.composite()?;
-    Ok(before)
-}
-
-async fn repro_reveal(core: &mut CanvasCore) -> Result<f32, canvas_core::CanvasError> {
-    core.apply_brush(&repro_paint(2, 40.0, 40.0, Color::rgba(0.0, 1.0, 0.0, 1.0)))?;
-    let _handle = core.composite()?;
-    Ok(core.debug_readback().await?.rgba_f32[repro_a_index()][0])
-}
-
-// Run one undo replay defect repro.
-fn run_undo_replay_defect_repro() -> Result<(bool, String), String> {
-    pollster::block_on(async {
-        // 闁革妇鍎ゅ▍?闁挎稒顒痭do_by_gpu_replay
-        let mut g = CanvasCore::new(repro_config()).await?;
-        let g_before = repro_build(&mut g).await?;
-        let g_tiles_before = repro_layer1_tiles(&g);
-        let report = g.undo_by_gpu_replay(1, Some(std::time::Duration::from_millis(50)))?;
-        let _handle = g.composite()?;
-        let g_tiles_after = repro_layer1_tiles(&g);
-        let g_red = repro_reveal(&mut g).await?;
-
-        // 闁革妇鍎ゅ▍?闁挎稑鐗嗛顕€鎮¤缁辨岸鏁嶅顓熺彯闂?undo()
-        let mut s = CanvasCore::new(repro_config()).await?;
-        let s_before = repro_build(&mut s).await?;
-        let s_tiles_before = repro_layer1_tiles(&s);
-        s.undo()?;
-        let _handle = s.composite()?;
-        let s_tiles_after = repro_layer1_tiles(&s);
-        let s_red = repro_reveal(&mut s).await?;
-
-        let baseline_ok = g_before > 0.9 && s_before > 0.9;
-        let reproduced = baseline_ok && g_tiles_after == 0 && g_red < 0.1;
-        let control_ok = s_tiles_after > 0 && s_red > 0.9;
-
-        let mut log = String::new();
-        log.push_str("鍦烘櫙1 undo_by_gpu_replay:\n");
-        log.push_str(&format!(
-            "  鎾ら攢鍓? 鍥惧眰1 tile={g_tiles_before}, 鍖哄煙A alpha={g_before:.3}\n"
-        ));
-        log.push_str(&format!(
-            "  鎾ら攢: replayed={}, batch={}, key_tile={}\n",
-            report.replayed_commands, report.batch_replay_used, report.key_tile_used
-        ));
-        log.push_str(&format!(
-            "  鎾ら攢鍚? 鍥惧眰1 tile={g_tiles_after}, 鎻ず鍖哄煙A red={g_red:.3}\n"
-        ));
-        log.push_str("鍦烘櫙2 undo() 瀵圭収:\n");
-        log.push_str(&format!(
-            "  鎾ら攢鍓?tile={s_tiles_before} -> 鎾ら攢鍚?tile={s_tiles_after}, 鎻ず鍖哄煙A red={s_red:.3}\n"
-        ));
-        log.push_str("------------------------------\n");
-        if reproduced && control_ok {
-            log.push_str(&format!(
-                "result: reproduced. replay undo cleared layer1 tiles from {g_tiles_before}; regular undo preserved layer1.\n"
-            ));
-        } else if baseline_ok && control_ok {
-            log.push_str("result: not reproduced; engine may already be fixed.\n");
-        } else {
-            log.push_str("result: inconclusive; baseline/control state was unexpected.\n");
-        }
-        Ok::<(bool, String), canvas_core::CanvasError>((reproduced, log))
-    })
-    .map_err(|error: canvas_core::CanvasError| format!("{error:?}"))
 }
 
 // Input sampling diagnostics.
@@ -343,7 +188,7 @@ struct CanvasApp {
     active_stroke: Option<StrokeId>,
     smooth_strength: f32,
     stab_mode: StabilizerMode,
-    /// 缂佹鏌ㄩ惃閿嬶紣閸曨噮娼旈柨娑欑煯缁楀倹绋夐埀顒傛暜瑜嶉崢婊堝冀閸パ呮綄妤犵偞娲栧妤呭冀?+ 妤犵偠娅曠划锕傛焻閻斿嘲顔?閻忕偛绻愮粻绌歺/缂?
+    /// Last cursor position used for preview prediction and input audit deltas.
     last_cursor: Option<egui::Pos2>,
     pred_vel: egui::Vec2,
     prediction: bool,
@@ -376,38 +221,42 @@ struct CanvasApp {
     new_canvas_width: u32,
     new_canvas_height: u32,
     new_canvas_tile_size: u32,
-    /// 濞戞挴鍋撴繛鍡忓墲閳ь儸鍛箒闂傚嫬鍢查ˇ鏌ユ偝閻楀牏銈撮悹鍥ㄦ礈缁劑寮稿鎰獥Ok((鐎瑰憡褰冮ˇ鏌ユ偝? 闁哄啨鍎辩换?) / Err(閺夆晜鍔橀、鎴︽煥濞嗘帩鍤?
-    defect_test: Option<Result<(bool, String), String>>,
+    trace_enabled: bool,
+    trace_level: CaptureLevel,
+    trace_budget_mb: u64,
+    trace_rebuild_result: Option<String>,
+    last_trace: Option<SessionTrace>,
+    trace_base_layers: Vec<LayerSnapshot>,
 }
 
 fn stamp_kind_label(kind: BrushStampKind) -> &'static str {
     match kind {
-        BrushStampKind::Circle => "鍦嗗舰",
-        BrushStampKind::Square => "鏂瑰舰",
-        BrushStampKind::Diamond => "鑿卞舰",
-        BrushStampKind::Stripe => "鏉＄汗",
+        BrushStampKind::Circle => "圆形",
+        BrushStampKind::Square => "方形",
+        BrushStampKind::Diamond => "菱形",
+        BrushStampKind::Stripe => "条纹",
     }
 }
 
 fn brush_preset_label(preset: BrushPreset) -> &'static str {
     match preset {
-        BrushPreset::SoftRound => "Soft Round",
-        BrushPreset::HardRound => "Hard Round",
-        BrushPreset::SoftRoundPressureSize => "Soft Round Pressure Size",
-        BrushPreset::HardRoundPressureSize => "Hard Round Pressure Size",
-        BrushPreset::SoftRoundPressureOpacity => "Soft Round Pressure Opacity",
-        BrushPreset::HardRoundPressureOpacity => "Hard Round Pressure Opacity",
-        BrushPreset::SoftRoundPressureOpacityFlow => "Soft Round Pressure Opacity + Flow",
-        BrushPreset::HardRoundPressureOpacityFlow => "Hard Round Pressure Opacity + Flow",
+        BrushPreset::SoftRound => "柔边圆形",
+        BrushPreset::HardRound => "硬边圆形",
+        BrushPreset::SoftRoundPressureSize => "柔边圆形（压力控制大小）",
+        BrushPreset::HardRoundPressureSize => "硬边圆形（压力控制大小）",
+        BrushPreset::SoftRoundPressureOpacity => "柔边圆形（压力控制不透明度）",
+        BrushPreset::HardRoundPressureOpacity => "硬边圆形（压力控制不透明度）",
+        BrushPreset::SoftRoundPressureOpacityFlow => "柔边圆形（压力控制不透明度和流量）",
+        BrushPreset::HardRoundPressureOpacityFlow => "硬边圆形（压力控制不透明度和流量）",
     }
 }
 
 fn selection_mode_label(mode: SelectionCombineMode) -> &'static str {
     match mode {
-        SelectionCombineMode::Replace => "鏇挎崲",
-        SelectionCombineMode::Add => "娣诲姞",
-        SelectionCombineMode::Subtract => "鍑忓幓",
-        SelectionCombineMode::Intersect => "鐩镐氦",
+        SelectionCombineMode::Replace => "替换",
+        SelectionCombineMode::Add => "添加",
+        SelectionCombineMode::Subtract => "减去",
+        SelectionCombineMode::Intersect => "相交",
     }
 }
 
@@ -418,6 +267,196 @@ fn selection_rect_from_points(a: SelectionPoint, b: SelectionPoint) -> Option<Se
     let max_y = a.y.max(b.y).ceil().max(0.0) as u32;
     (max_x > min_x && max_y > min_y)
         .then(|| SelectionRect::new(min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+const CAPTURE_LEVELS: [CaptureLevel; 4] = [
+    CaptureLevel::L0Structure,
+    CaptureLevel::L1PointStream,
+    CaptureLevel::L2PixelDelta,
+    CaptureLevel::L3SparseCheckpoint,
+];
+
+fn capture_level_label(level: CaptureLevel) -> &'static str {
+    match level {
+        CaptureLevel::L0Structure => "L0 结构事件",
+        CaptureLevel::L1PointStream => "L1 笔触点流",
+        CaptureLevel::L2PixelDelta => "L2 像素变化（当前降级）",
+        CaptureLevel::L3SparseCheckpoint => "L3 稀疏存档点（当前降级）",
+    }
+}
+
+fn capture_config(enabled: bool, level: CaptureLevel, budget_mb: u64) -> DataCaptureConfig {
+    DataCaptureConfig {
+        enabled,
+        level,
+        max_bytes_per_session: budget_mb.max(1).saturating_mul(1024 * 1024),
+        allow_gpu_readback: false,
+        ..DataCaptureConfig::default()
+    }
+}
+
+fn initial_capture_config() -> DataCaptureConfig {
+    capture_config(true, CaptureLevel::L1PointStream, 8)
+}
+
+fn trace_report_summary(report: &TraceReport) -> String {
+    format!(
+        "命令={}，笔触={}，点={}，图层事件={}，选区事件={}，dirty 摘要={}，资源引用={}，降级={}，估算={} KB",
+        report.command_count,
+        report.stroke_count,
+        report.point_count,
+        report.layer_event_count,
+        report.selection_event_count,
+        report.dirty_summary_count,
+        report.resource_reference_count,
+        report.degradation_count,
+        report.estimated_bytes / 1024
+    )
+}
+
+fn max_pixel_abs_diff(a: &[[f32; 4]], b: &[[f32; 4]]) -> Option<f32> {
+    (a.len() == b.len()).then(|| {
+        a.iter()
+            .zip(b)
+            .flat_map(|(left, right)| {
+                left.iter()
+                    .zip(right)
+                    .map(|(left, right)| (left - right).abs())
+            })
+            .fold(0.0_f32, f32::max)
+    })
+}
+
+fn trace_rebuild_summary(trace: &SessionTrace, max_diff: f32) -> String {
+    format!(
+        "已重构到画布：命令={}，点={}，资源引用={}，降级={}，重构前最大像素误差={max_diff:.6}",
+        trace.report.command_count,
+        trace.report.point_count,
+        trace.report.resource_reference_count,
+        trace.report.degradation_count
+    )
+}
+
+fn trace_status_label(
+    enabled: bool,
+    has_current_trace: bool,
+    has_cached_trace: bool,
+) -> &'static str {
+    match (enabled, has_current_trace, has_cached_trace) {
+        (_, true, _) => "正在记录当前绘画",
+        (false, false, true) => "记录已停止，可重构上次记录",
+        (true, false, true) => "当前记录未创建，仍可重构上次记录",
+        _ => "还没有可用记录",
+    }
+}
+
+fn trace_base_layer_commands(layers: &[LayerSnapshot]) -> Vec<CanvasCommand> {
+    let mut commands = Vec::with_capacity(layers.len().saturating_mul(3));
+    for layer in layers {
+        commands.push(CanvasCommand::AddLayer(layer.spec.clone()));
+    }
+    for layer in layers {
+        if let Some(parent) = layer.parent {
+            commands.push(CanvasCommand::SetLayerParent {
+                id: layer.spec.id,
+                parent: Some(parent),
+            });
+        }
+        if layer.group_mode != LayerGroupMode::PassThrough {
+            commands.push(CanvasCommand::SetLayerGroupMode {
+                id: layer.spec.id,
+                mode: layer.group_mode,
+            });
+        }
+    }
+    commands
+}
+
+fn replay_trace_commands_into_core(
+    core: &mut CanvasCore,
+    trace: &SessionTrace,
+    base_layers: &[LayerSnapshot],
+) -> Result<(), CanvasError> {
+    let mut config = trace.canvas;
+    config.data_capture.enabled = false;
+    core.set_data_capture_config(config.data_capture);
+    core.execute(&CanvasCommand::NewCanvas(config))?;
+    for command in trace_base_layer_commands(base_layers) {
+        core.execute(&command)?;
+    }
+    let mut stroke_id_map = HashMap::new();
+    for (event_index, event) in trace.events.iter().enumerate() {
+        let canvas_core::TraceEventKind::Command(command) = &event.kind else {
+            continue;
+        };
+        let Some(canvas_core::TraceReplayCommand::Command(command)) = &command.replay else {
+            return Err(CanvasError::MissingTraceResource(
+                "测试程序重构暂不解析外部资源引用".to_owned(),
+            ));
+        };
+        let command = remap_replay_stroke_command(command, &stroke_id_map);
+        match &command {
+            CanvasCommand::AddLayer(spec)
+                if core
+                    .layer_snapshot()
+                    .iter()
+                    .any(|layer| layer.spec.id == spec.id) =>
+            {
+                continue;
+            }
+            CanvasCommand::AppendStroke(command)
+                if !stroke_id_map.values().any(|id| *id == command.stroke) =>
+            {
+                continue;
+            }
+            CanvasCommand::EndStroke(stroke) if !stroke_id_map.values().any(|id| id == stroke) => {
+                continue;
+            }
+            CanvasCommand::BeginStroke(_) => {
+                let output = core.execute(&command)?;
+                if let CommandOutput::StrokeStarted { id: new_id } = output
+                    && let Some(old_id) = trace_stroke_begin_after(trace, event_index)
+                {
+                    stroke_id_map.insert(old_id, new_id);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        core.execute(&command)?;
+    }
+    Ok(())
+}
+
+fn trace_stroke_begin_after(trace: &SessionTrace, command_index: usize) -> Option<StrokeId> {
+    trace
+        .events
+        .iter()
+        .skip(command_index.saturating_add(1))
+        .take_while(|event| !matches!(event.kind, canvas_core::TraceEventKind::Command(_)))
+        .find_map(|event| match &event.kind {
+            canvas_core::TraceEventKind::StrokeBegin(begin) => Some(begin.stroke),
+            _ => None,
+        })
+}
+
+fn remap_replay_stroke_command(
+    command: &CanvasCommand,
+    stroke_id_map: &HashMap<StrokeId, StrokeId>,
+) -> CanvasCommand {
+    match command {
+        CanvasCommand::AppendStroke(command) => {
+            let mut command = command.clone();
+            if let Some(stroke) = stroke_id_map.get(&command.stroke) {
+                command.stroke = *stroke;
+            }
+            CanvasCommand::AppendStroke(command)
+        }
+        CanvasCommand::EndStroke(stroke) => {
+            CanvasCommand::EndStroke(stroke_id_map.get(stroke).copied().unwrap_or(*stroke))
+        }
+        _ => command.clone(),
+    }
 }
 
 impl CanvasApp {
@@ -434,10 +473,10 @@ impl CanvasApp {
             .expect("canvas display requires WGPU render state");
 
         let mut core_guard = core.lock().unwrap();
-        core_guard.present().expect("鏄剧ず鐢诲竷澶辫触");
+        core_guard.present().expect("显示画布失败");
         let texture_view = core_guard
             .presentation_texture_view()
-            .expect("鏄剧ず鍚庡簲瀛樺湪鐢诲竷绾圭悊瑙嗗浘");
+            .expect("显示后应存在画布纹理视图");
         drop(core_guard);
 
         let mut renderer = render_state.renderer.write();
@@ -451,6 +490,8 @@ impl CanvasApp {
                 ..Default::default()
             },
         );
+
+        let trace_base_layers = core.lock().unwrap().layer_snapshot();
 
         Self {
             core,
@@ -495,7 +536,12 @@ impl CanvasApp {
             new_canvas_width: 1024,
             new_canvas_height: 1024,
             new_canvas_tile_size: 256,
-            defect_test: None,
+            trace_enabled: true,
+            trace_level: CaptureLevel::L1PointStream,
+            trace_budget_mb: 8,
+            trace_rebuild_result: None,
+            last_trace: None,
+            trace_base_layers,
         }
     }
 
@@ -536,9 +582,9 @@ impl CanvasApp {
     }
 
     // composite + present, refresh display texture.
-    fn refresh(core: &mut CanvasCore) {
-        let _ = core.execute(&CanvasCommand::Composite);
-        let _ = core.present();
+    fn refresh(core: &mut CanvasCore) -> Result<(), canvas_core::CanvasError> {
+        core.composite()?;
+        core.present()
     }
 
     fn layers(&self) -> Vec<LayerSnapshot> {
@@ -558,9 +604,11 @@ impl CanvasApp {
     fn execute_canvas_command(&mut self, command: CanvasCommand) {
         let result = {
             let mut core = self.core.lock().unwrap();
-            let result = core.execute(&command);
-            if result.is_ok() {
-                Self::refresh(&mut core);
+            let mut result = core.execute(&command);
+            if result.is_ok()
+                && let Err(error) = Self::refresh(&mut core)
+            {
+                result = Err(error);
             }
             result
         };
@@ -588,17 +636,19 @@ impl CanvasApp {
                 self.last_error = None;
                 if cut {
                     let mut core = self.core.lock().unwrap();
-                    Self::refresh(&mut core);
+                    if let Err(error) = Self::refresh(&mut core) {
+                        self.last_error = Some(error.to_string());
+                    }
                 }
             }
-            Ok(None) => self.last_error = Some("no active selection to copy".to_owned()),
+            Ok(None) => self.last_error = Some("没有可复制的活动选区".to_owned()),
             Err(error) => self.last_error = Some(error.to_string()),
         }
     }
 
     fn paste_clipboard_to_active_layer(&mut self) {
         let Some(pixels) = self.clipboard.clone() else {
-            self.last_error = Some("clipboard is empty".to_owned());
+            self.last_error = Some("剪贴板为空".to_owned());
             return;
         };
 
@@ -606,22 +656,24 @@ impl CanvasApp {
         let origin_y = pixels.bounds.y;
         let result = {
             let mut core = self.core.lock().unwrap();
-            let result = core.paste_pixels_to_layer(self.layer_id, &pixels, origin_x, origin_y);
-            if result.is_ok() {
-                Self::refresh(&mut core);
+            let mut result = core.paste_pixels_to_layer(self.layer_id, &pixels, origin_x, origin_y);
+            if result.is_ok()
+                && let Err(error) = Self::refresh(&mut core)
+            {
+                result = Err(error);
             }
             result
         };
         match result {
             Ok(true) => self.last_error = None,
-            Ok(false) => self.last_error = Some("paste area is outside canvas".to_owned()),
+            Ok(false) => self.last_error = Some("粘贴区域超出画布".to_owned()),
             Err(error) => self.last_error = Some(error.to_string()),
         }
     }
 
     fn paste_clipboard_to_new_layer(&mut self) {
         let Some(pixels) = self.clipboard.clone() else {
-            self.last_error = Some("clipboard is empty".to_owned());
+            self.last_error = Some("剪贴板为空".to_owned());
             return;
         };
 
@@ -630,14 +682,16 @@ impl CanvasApp {
         let origin_y = pixels.bounds.y;
         let result = {
             let mut core = self.core.lock().unwrap();
-            let result = core.paste_pixels_to_new_layer(
+            let mut result = core.paste_pixels_to_new_layer(
                 LayerSpec::new(layer_id),
                 &pixels,
                 origin_x,
                 origin_y,
             );
-            if result.is_ok() {
-                Self::refresh(&mut core);
+            if result.is_ok()
+                && let Err(error) = Self::refresh(&mut core)
+            {
+                result = Err(error);
             }
             result
         };
@@ -647,7 +701,7 @@ impl CanvasApp {
                 self.next_layer_id = self.next_layer_id.saturating_add(1);
                 self.last_error = None;
             }
-            Ok(false) => self.last_error = Some("绮樿创鍖哄煙鍦ㄧ敾甯冨".to_owned()),
+            Ok(false) => self.last_error = Some("粘贴区域在画布外".to_owned()),
             Err(error) => self.last_error = Some(error.to_string()),
         }
         self.sync_active_layer();
@@ -860,7 +914,7 @@ impl CanvasApp {
         let texture_view = {
             let core = self.core.lock().unwrap();
             core.presentation_texture_view()
-                .ok_or_else(|| "presentation texture view is missing".to_owned())?
+                .ok_or_else(|| "缺少呈现纹理视图".to_owned())?
         };
 
         let mut renderer = render_state.renderer.write();
@@ -882,7 +936,7 @@ impl CanvasApp {
 
     fn create_new_canvas(&mut self, frame: &mut eframe::Frame) {
         let Some(render_state) = frame.wgpu_render_state() else {
-            self.last_error = Some("cannot access WGPU render state".to_owned());
+            self.last_error = Some("无法访问 WGPU 渲染状态".to_owned());
             return;
         };
 
@@ -898,7 +952,7 @@ impl CanvasApp {
             let mut core = self.core.lock().unwrap();
             core.execute(&CanvasCommand::NewCanvas(config))
                 .and_then(|_| core.execute(&CanvasCommand::AddLayer(LayerSpec::new(LayerId(1)))))
-                .and_then(|_| core.execute(&CanvasCommand::Composite))
+                .and_then(|_| core.composite().map(|_| CommandOutput::None))
                 .and_then(|_| core.present().map(|()| CommandOutput::None))
         };
 
@@ -917,6 +971,7 @@ impl CanvasApp {
                 self.last_pressure = self.fallback_pressure;
                 self.pressure_from_device = false;
                 self.stamp_texture_id = None;
+                self.trace_base_layers = self.core.lock().unwrap().layer_snapshot();
                 if let Err(error) = self.register_presentation_texture(render_state) {
                     self.last_error = Some(error);
                 } else {
@@ -929,124 +984,123 @@ impl CanvasApp {
             }
         }
     }
-    // Run one-shot live canvas defect repro.
-    fn run_defect_on_live_canvas(&mut self, frame: &mut eframe::Frame) {
+
+    fn apply_trace_config(&mut self) {
+        let capture = capture_config(self.trace_enabled, self.trace_level, self.trace_budget_mb);
+        let mut core = self.core.lock().unwrap();
+        if let Some(trace) = core.session_trace().cloned() {
+            self.last_trace = Some(trace);
+        }
+        if self.trace_enabled {
+            self.trace_base_layers = core.layer_snapshot();
+        }
+        core.set_data_capture_config(capture);
+        if self.trace_enabled {
+            self.trace_rebuild_result = None;
+        }
+        self.last_error = None;
+    }
+
+    fn trace_report(&self) -> Option<TraceReport> {
+        self.core
+            .lock()
+            .unwrap()
+            .trace_report()
+            .or_else(|| self.last_trace.as_ref().map(|trace| trace.report.clone()))
+    }
+
+    fn rebuild_from_trace(&mut self, frame: &mut eframe::Frame) {
         let Some(render_state) = frame.wgpu_render_state() else {
-            self.defect_test = Some(Err("cannot access WGPU render state".to_owned()));
+            self.trace_rebuild_result = Some("无法访问 WGPU 渲染状态，不能显示重构结果".to_owned());
+            return;
+        };
+        let trace = self
+            .core
+            .lock()
+            .unwrap()
+            .session_trace()
+            .cloned()
+            .or_else(|| self.last_trace.clone());
+        let Some(trace) = trace else {
+            self.trace_rebuild_result = Some("还没有可重构的记录".to_owned());
             return;
         };
 
-        let core_arc = self.core.clone();
-        let cfg = core_arc.lock().unwrap().config();
-        let w = cfg.width as f32;
-        let h = cfg.height as f32;
-        let cx = w * 0.5;
-        let cy = h * 0.5;
-        let full_r = w.max(h);
-        let a_index = (cy as usize) * cfg.width as usize + cx as usize;
-        let red = Color::rgba(1.0, 0.0, 0.0, 1.0);
-        let green = Color::rgba(0.0, 1.0, 0.0, 1.0);
+        let base_layers = self.trace_base_layers.clone();
+        let result = pollster::block_on(async {
+            let original = {
+                let mut core = self.core.lock().unwrap();
+                core.composite()?;
+                core.debug_readback().await?
+            };
 
-        let result: Result<(bool, String), String> = pollster::block_on(async {
-            let mut core = core_arc.lock().unwrap();
-            let to_err = |e: canvas_core::CanvasError| e.to_string();
-
-            core.execute(&CanvasCommand::NewCanvas(cfg))
-                .map_err(to_err)?;
-            core.execute(&CanvasCommand::AddLayer(LayerSpec::new(LayerId(1))))
-                .map_err(to_err)?;
-            core.execute(&CanvasCommand::AddLayer(LayerSpec::new(LayerId(2))))
-                .map_err(to_err)?;
-
-            // Layer 1 fills red; layer 2 gets a green corner stroke.
-            core.apply_brush(&live_paint(1, cx, cy, full_r, red))
-                .map_err(to_err)?;
-            core.apply_brush(&live_paint(2, w * 0.85, h * 0.15, h * 0.08, green))
-                .map_err(to_err)?;
-            let _handle = core.composite().map_err(to_err)?;
-            let before_red = core.debug_readback().await.map_err(to_err)?.rgba_f32[a_index][0];
-
-            // 濠㈡儼椴搁弲銉╂晬濮樿泛娅㈤柟鐑樺笒濞存浠?-> 婵炴挸鎳愰埞鏍川閹存帗濮㈤梺鎻掔У閺備線寮妷銉х闁挎稑鐗嗛崕姘辨閻樿京鐭濋柛锔荤厜缁?            core.move_layer(LayerId(2), 0).map_err(to_err)?;
-            // Draw another layer 2 stroke that will be undone.
-            core.apply_brush(&live_paint(2, w * 0.85, h * 0.85, h * 0.08, green))
-                .map_err(to_err)?;
-            let _handle = core.composite().map_err(to_err)?;
-            let tiles_before = core
-                .layer_snapshot()
-                .iter()
-                .find(|s| s.spec.id.0 == 1)
-                .map_or(0, |s| s.tile_count);
-
-            // 闁?undo_by_gpu_replay 闁逛勘鍊濋弨銏ゆ焽閿濆嫮顏辩紒妤佹⒐濡倝宕楀畷鍥ㄧ暠闁搞儲鍎抽惇? 缂佹妫佽
-            let report = core
-                .undo_by_gpu_replay(1, Some(std::time::Duration::from_millis(50)))
-                .map_err(to_err)?;
-            let _handle = core.composite().map_err(to_err)?;
-            let tiles_after = core
-                .layer_snapshot()
-                .iter()
-                .find(|s| s.spec.id.0 == 1)
-                .map_or(0, |s| s.tile_count);
-
-            core.apply_brush(&live_paint(2, cx, cy, full_r, green))
-                .map_err(to_err)?;
-            let _handle = core.composite().map_err(to_err)?;
-            let after_red = core.debug_readback().await.map_err(to_err)?.rgba_f32[a_index][0];
-
-            let reproduced = before_red > 0.9 && tiles_after == 0 && after_red < 0.1;
-            let mut log = String::new();
-            log.push_str(&format!(
-                "before replay undo: layer1 tiles={tiles_before}, red={before_red:.3}\n"
-            ));
-            log.push_str(&format!(
-                "undo replay: replayed={}, batch={}\n",
-                report.replayed_commands, report.batch_replay_used
-            ));
-            log.push_str(&format!("after replay undo: layer1 tiles={tiles_after}\n"));
-            log.push_str(&format!("after green reveal: red={after_red:.3}\n"));
-            log.push_str("------------------------------\n");
-            if reproduced {
-                log.push_str("result: reproduced. live canvas turned green after replay undo.\n");
-            } else {
-                log.push_str("result: not reproduced or inconclusive.\n");
-            }
-            Ok::<(bool, String), String>((reproduced, log))
+            let rebuilt = {
+                let mut core = self.core.lock().unwrap();
+                replay_trace_commands_into_core(&mut core, &trace, &base_layers)?;
+                core.composite()?;
+                core.present()?;
+                core.debug_readback().await?
+            };
+            let max_diff = max_pixel_abs_diff(&original.rgba_f32, &rebuilt.rgba_f32)
+                .ok_or(CanvasError::InvalidCanvasSize)?;
+            Ok::<f32, CanvasError>(max_diff)
         });
 
-        // Refresh display texture so the canvas reflects the final state.
-        {
-            let mut core = core_arc.lock().unwrap();
-            Self::refresh(&mut core);
-        }
-        // NewCanvas reallocates the presentation texture, so the previously
-        // registered egui texture id is stale; re-register it or the canvas
-        // would not visibly update after the demo.
-        if let Err(error) = self.register_presentation_texture(render_state) {
-            self.last_error = Some(error);
-        }
-        // Reset interaction state.
-        self.layer_id = LayerId(1);
-        self.next_layer_id = 3;
-        self.active_stroke = None;
-        self.last_cursor = None;
-        self.pred_vel = egui::Vec2::ZERO;
-        self.zoom = 1.0;
-        self.pan = egui::Vec2::ZERO;
-        self.canvas_width = w;
-        self.canvas_height = h;
-        self.audit.reset();
-        self.defect_test = Some(result);
+        self.trace_rebuild_result = Some(match result {
+            Ok(max_diff) => {
+                self.layer_id = self
+                    .core
+                    .lock()
+                    .unwrap()
+                    .layer_snapshot()
+                    .last()
+                    .map_or(LayerId(1), |layer| layer.spec.id);
+                self.next_layer_id = self
+                    .core
+                    .lock()
+                    .unwrap()
+                    .layer_snapshot()
+                    .iter()
+                    .map(|layer| layer.spec.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                self.canvas_width = trace.canvas.width as f32;
+                self.canvas_height = trace.canvas.height as f32;
+                self.trace_enabled = false;
+                self.trace_base_layers = self.core.lock().unwrap().layer_snapshot();
+                if let Err(error) = self.register_presentation_texture(render_state) {
+                    format!("重构已完成，但显示纹理注册失败：{error}")
+                } else {
+                    trace_rebuild_summary(&trace, max_diff)
+                }
+            }
+            Err(error) => format!("重构失败：{error}"),
+        });
     }
 }
 
 fn install_chinese_fonts(ctx: &egui::Context) {
     const FONT_PATHS: &[&str] = &[
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/Library/Fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\msyh.ttf",
         r"C:\Windows\Fonts\simhei.ttf",
         r"C:\Windows\Fonts\simsun.ttc",
     ];
 
-    let Some(font_bytes) = FONT_PATHS.iter().find_map(|path| fs::read(path).ok()) else {
+    let Some((font_path, font_bytes)) = FONT_PATHS
+        .iter()
+        .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)))
+    else {
+        eprintln!("未找到可用中文字体，测试程序中文界面可能显示为方框或乱码");
         return;
     };
 
@@ -1066,6 +1120,7 @@ fn install_chinese_fonts(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+    eprintln!("已加载中文字体: {font_path}");
 }
 
 const BLEND_MODES: [BlendMode; 15] = [
@@ -1088,38 +1143,38 @@ const BLEND_MODES: [BlendMode; 15] = [
 
 fn blend_mode_label(mode: BlendMode) -> &'static str {
     match mode {
-        BlendMode::Normal => "姝ｅ父",
-        BlendMode::Multiply => "姝ｇ墖鍙犲簳",
-        BlendMode::Screen => "婊よ壊",
-        BlendMode::Overlay => "鍙犲姞",
-        BlendMode::SoftLight => "鏌斿厜",
-        BlendMode::ColorDodge => "棰滆壊鍑忔贰",
-        BlendMode::LinearBurn => "Linear Burn",
-        BlendMode::ColorBurn => "棰滆壊鍔犳繁",
-        BlendMode::Add => "娣诲姞",
-        BlendMode::Difference => "Difference",
-        BlendMode::Subtract => "鍑忓幓",
-        BlendMode::Darken => "鍙樻殫",
-        BlendMode::Lighten => "鍙樹寒",
-        BlendMode::HardLight => "寮哄厜",
-        BlendMode::Exclusion => "鎺掗櫎",
+        BlendMode::Normal => "正常",
+        BlendMode::Multiply => "正片叠底",
+        BlendMode::Screen => "滤色",
+        BlendMode::Overlay => "叠加",
+        BlendMode::SoftLight => "柔光",
+        BlendMode::ColorDodge => "颜色减淡",
+        BlendMode::LinearBurn => "线性加深",
+        BlendMode::ColorBurn => "颜色加深",
+        BlendMode::Add => "添加",
+        BlendMode::Difference => "差值",
+        BlendMode::Subtract => "减去",
+        BlendMode::Darken => "变暗",
+        BlendMode::Lighten => "变亮",
+        BlendMode::HardLight => "强光",
+        BlendMode::Exclusion => "排除",
     }
 }
 
 fn group_mode_label(mode: LayerGroupMode) -> &'static str {
     match mode {
-        LayerGroupMode::PassThrough => "Pass Through",
-        LayerGroupMode::Isolated => "闅旂",
+        LayerGroupMode::PassThrough => "穿透",
+        LayerGroupMode::Isolated => "隔离",
     }
 }
 
 fn layer_label(id: LayerId) -> String {
-    format!("鍥惧眰 {}", id.0)
+    format!("图层 {}", id.0)
 }
 
 impl CanvasApp {
     fn show_layer_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("鍥惧眰");
+        ui.heading("图层");
 
         let layers = self.layers();
         let selected_index = layers
@@ -1127,7 +1182,7 @@ impl CanvasApp {
             .position(|layer| layer.spec.id == self.layer_id);
 
         ui.horizontal(|ui| {
-            if ui.button("鏂板缓").clicked() {
+            if ui.button("新建").clicked() {
                 let id = LayerId(self.next_layer_id);
                 self.next_layer_id = self.next_layer_id.saturating_add(1);
                 self.layer_id = id;
@@ -1135,13 +1190,13 @@ impl CanvasApp {
             }
 
             if ui
-                .add_enabled(layers.len() > 1, egui::Button::new("鍒犻櫎"))
+                .add_enabled(layers.len() > 1, egui::Button::new("删除"))
                 .clicked()
             {
                 self.execute_canvas_command(CanvasCommand::RemoveLayer(self.layer_id));
             }
 
-            if ui.button("Clear").clicked() {
+            if ui.button("清空").clicked() {
                 self.execute_canvas_command(CanvasCommand::ClearLayer(self.layer_id));
             }
         });
@@ -1150,7 +1205,7 @@ impl CanvasApp {
             if ui
                 .add_enabled(
                     selected_index.is_some_and(|index| index + 1 < layers.len()),
-                    egui::Button::new("涓婄Щ"),
+                    egui::Button::new("上移"),
                 )
                 .clicked()
                 && let Some(index) = selected_index
@@ -1164,7 +1219,7 @@ impl CanvasApp {
             if ui
                 .add_enabled(
                     selected_index.is_some_and(|index| index > 0),
-                    egui::Button::new("涓嬬Щ"),
+                    egui::Button::new("下移"),
                 )
                 .clicked()
                 && let Some(index) = selected_index
@@ -1181,14 +1236,14 @@ impl CanvasApp {
             .show(ui, |ui| {
                 for layer in layers.iter().rev() {
                     let marker = if layer.spec.visible {
-                        "visible"
+                        "可见"
                     } else {
-                        "hidden"
+                        "隐藏"
                     };
                     let response = ui.selectable_label(
                         layer.spec.id == self.layer_id,
                         format!(
-                            "{marker} {}  {:.0}%  {} tiles",
+                            "{marker} {}  {:.0}%  {} 个 tile",
                             layer_label(layer.spec.id),
                             layer.spec.opacity * 100.0,
                             layer.tile_count
@@ -1208,21 +1263,21 @@ impl CanvasApp {
             let mut spec = layer.spec.clone();
             let old_spec = spec.clone();
 
-            ui.add(egui::Slider::new(&mut spec.opacity, 0.0..=1.0).text("Opacity"));
-            ui.checkbox(&mut spec.alpha_locked, "Lock alpha");
-            ui.checkbox(&mut spec.clip_to_below, "Clip to below");
+            ui.add(egui::Slider::new(&mut spec.opacity, 0.0..=1.0).text("不透明度"));
+            ui.checkbox(&mut spec.alpha_locked, "锁定透明度");
+            ui.checkbox(&mut spec.clip_to_below, "裁剪到下方图层");
 
-            egui::ComboBox::from_label("Blend mode")
+            egui::ComboBox::from_label("混合模式")
                 .selected_text(blend_mode_label(spec.blend_mode))
                 .show_ui(ui, |ui| {
                     for mode in BLEND_MODES {
                         ui.selectable_value(&mut spec.blend_mode, mode, blend_mode_label(mode));
                     }
                 });
-            egui::ComboBox::from_label("Mask layer")
-                .selected_text(spec.mask_layer.map_or_else(|| "None".to_owned(), layer_label))
+            egui::ComboBox::from_label("蒙版图层")
+                .selected_text(spec.mask_layer.map_or_else(|| "无".to_owned(), layer_label))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut spec.mask_layer, None, "None");
+                    ui.selectable_value(&mut spec.mask_layer, None, "无");
                     for candidate in layers
                         .iter()
                         .map(|layer| layer.spec.id)
@@ -1242,10 +1297,10 @@ impl CanvasApp {
 
             let mut parent = layer.parent;
             let old_parent = parent;
-            egui::ComboBox::from_label("Parent")
-                .selected_text(parent.map_or_else(|| "None".to_owned(), layer_label))
+            egui::ComboBox::from_label("父图层")
+                .selected_text(parent.map_or_else(|| "无".to_owned(), layer_label))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut parent, None, "None");
+                    ui.selectable_value(&mut parent, None, "无");
                     for candidate in layers
                         .iter()
                         .map(|layer| layer.spec.id)
@@ -1263,7 +1318,7 @@ impl CanvasApp {
 
             let mut group_mode = layer.group_mode;
             let old_group_mode = group_mode;
-            egui::ComboBox::from_label("Group mode")
+            egui::ComboBox::from_label("组模式")
                 .selected_text(group_mode_label(group_mode))
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
@@ -1296,13 +1351,13 @@ impl eframe::App for CanvasApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         egui::Panel::left("controls").show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("宸ュ叿");
+                ui.heading("工具");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tool_mode, ToolMode::Brush, "鐢荤瑪");
-                    ui.selectable_value(&mut self.tool_mode, ToolMode::RectSelection, "Rect");
-                    ui.selectable_value(&mut self.tool_mode, ToolMode::LassoSelection, "濂楃储");
+                    ui.selectable_value(&mut self.tool_mode, ToolMode::Brush, "画笔");
+                    ui.selectable_value(&mut self.tool_mode, ToolMode::RectSelection, "矩形");
+                    ui.selectable_value(&mut self.tool_mode, ToolMode::LassoSelection, "套索");
                 });
-                egui::ComboBox::from_label("閫夊尯缁勫悎")
+                egui::ComboBox::from_label("选区组合")
                     .selected_text(selection_mode_label(self.selection_mode))
                     .show_ui(ui, |ui| {
                         for mode in [
@@ -1320,10 +1375,10 @@ impl eframe::App for CanvasApp {
                     });
                 ui.separator();
 
-                ui.heading("鐢荤瑪");
-                ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=50.0).text("澶у皬"));
+                ui.heading("画笔");
+                ui.add(egui::Slider::new(&mut self.brush_radius, 1.0..=50.0).text("大小"));
                 let mut preset = self.brush_preset;
-                egui::ComboBox::from_label("PS Brush")
+                egui::ComboBox::from_label("PS 画笔")
                     .selected_text(brush_preset_label(preset))
                     .show_ui(ui, |ui| {
                         for option in BrushPreset::ALL {
@@ -1334,24 +1389,20 @@ impl eframe::App for CanvasApp {
                     self.apply_brush_preset(preset);
                 }
                 if ui
-                    .add(egui::Slider::new(&mut self.smooth_strength, 0.0..=1.0).text("Smooth"))
+                    .add(egui::Slider::new(&mut self.smooth_strength, 0.0..=1.0).text("平滑"))
                     .changed()
                 {
                     let mut core = self.core.lock().unwrap();
                     core.set_stabilizer_strength(self.smooth_strength);
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Stabilizer");
+                    ui.label("稳定器");
                     let mut changed = false;
                     changed |= ui
-                        .selectable_value(&mut self.stab_mode, StabilizerMode::Adaptive, "Adaptive")
+                        .selectable_value(&mut self.stab_mode, StabilizerMode::Adaptive, "自适应")
                         .changed();
                     changed |= ui
-                        .selectable_value(
-                            &mut self.stab_mode,
-                            StabilizerMode::PulledString,
-                            "Pulled String",
-                        )
+                        .selectable_value(&mut self.stab_mode, StabilizerMode::PulledString, "拉绳")
                         .changed();
                     if changed {
                         let mut core = self.core.lock().unwrap();
@@ -1359,36 +1410,36 @@ impl eframe::App for CanvasApp {
                     }
                 });
 
-                ui.label("棰滆壊");
+                ui.label("颜色");
                 ui.color_edit_button_rgba_unmultiplied(&mut self.brush_color);
 
-                ui.add(egui::Slider::new(&mut self.fallback_pressure, 0.01..=1.0).text("妯℃嫙鍘嬪姏"));
+                ui.add(egui::Slider::new(&mut self.fallback_pressure, 0.01..=1.0).text("模拟压力"));
                 ui.label(format!(
-                    "鍘嬪姏: {:.2} ({})",
+                    "压力: {:.2} ({})",
                     self.last_pressure,
                     if self.pressure_from_device {
-                        "璁惧"
+                        "设备"
                     } else {
-                        "妯℃嫙"
+                        "模拟"
                     }
                 ));
 
-                ui.checkbox(&mut self.prediction, "绗斿皷棰勮");
-                ui.checkbox(&mut self.core_prediction, "鏍稿績棰勬祴灏炬");
+                ui.checkbox(&mut self.prediction, "笔尖预览");
+                ui.checkbox(&mut self.core_prediction, "核心预测尾段");
 
                 ui.separator();
-                ui.heading("Brush dynamics");
+                ui.heading("画笔动态");
                 ui.label(format!(
-                    "Pressure mapping: {}",
+                    "压力映射: {}",
                     if self.pressure_dynamics {
-                        "PS preset"
+                        "PS 预设"
                     } else {
-                        "off"
+                        "关闭"
                     }
                 ));
-                ui.checkbox(&mut self.velocity_dynamics, "Velocity dynamics");
-                ui.checkbox(&mut self.texture_grain, "鍘嬪姏绾圭悊棰楃矑");
-                egui::ComboBox::from_label("Brush shape")
+                ui.checkbox(&mut self.velocity_dynamics, "速度动态");
+                ui.checkbox(&mut self.texture_grain, "压力纹理颗粒");
+                egui::ComboBox::from_label("笔尖形状")
                     .selected_text(stamp_kind_label(self.stamp_kind))
                     .show_ui(ui, |ui| {
                         ui.selectable_value(
@@ -1412,23 +1463,23 @@ impl eframe::App for CanvasApp {
                             stamp_kind_label(BrushStampKind::Stripe),
                         );
                     });
-                ui.add(egui::Slider::new(&mut self.stamp_hardness, 0.0..=1.0).text("绗斿皷纭害"));
-                ui.add(egui::Slider::new(&mut self.stamp_aspect, 0.125..=4.0).text("Aspect"));
-                ui.add(egui::Slider::new(&mut self.stamp_angle, 0.0..=1.0).text("绗斿皷瑙掑害"));
-                ui.checkbox(&mut self.stamp_texture, "澶栭儴绗斿皷绾圭悊閬僵");
+                ui.add(egui::Slider::new(&mut self.stamp_hardness, 0.0..=1.0).text("笔尖硬度"));
+                ui.add(egui::Slider::new(&mut self.stamp_aspect, 0.125..=4.0).text("宽高比"));
+                ui.add(egui::Slider::new(&mut self.stamp_angle, 0.0..=1.0).text("笔尖角度"));
+                ui.checkbox(&mut self.stamp_texture, "外部笔尖纹理遮罩");
                 self.sync_core_brush_settings();
-                ui.label("Brush mode");
+                ui.label("画笔模式");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.brush_mode, BrushMode::Paint, "Paint");
-                    ui.selectable_value(&mut self.brush_mode, BrushMode::Erase, "Erase");
+                    ui.selectable_value(&mut self.brush_mode, BrushMode::Paint, "绘制");
+                    ui.selectable_value(&mut self.brush_mode, BrushMode::Erase, "擦除");
                 });
 
                 ui.separator();
-                ui.heading("閫夊尯");
+                ui.heading("选区");
                 let selection_report = self.core.lock().unwrap().selection_report();
                 if let Some(bounds) = selection_report.bounds {
                     ui.label(format!(
-                        "鑼冨洿: {},{} {}x{}  鍒嗘={}",
+                        "范围: {},{} {}x{}  分段={}",
                         bounds.x,
                         bounds.y,
                         bounds.width,
@@ -1436,113 +1487,86 @@ impl eframe::App for CanvasApp {
                         selection_report.span_count
                     ));
                 } else {
-                    ui.label("鏃犳椿鍔ㄩ€夊尯");
+                    ui.label("无活动选区");
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("娓呴櫎閫夊尯").clicked() {
+                    if ui.button("清除选区").clicked() {
                         self.execute_canvas_command(CanvasCommand::ClearSelection);
                     }
-                    if ui.button("Invert").clicked() {
+                    if ui.button("反选").clicked() {
                         self.execute_canvas_command(CanvasCommand::InvertSelection);
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("娓呯┖閫変腑鍍忕礌").clicked() {
+                    if ui.button("清空选中像素").clicked() {
                         self.execute_canvas_command(CanvasCommand::ClearSelectedPixels(
                             self.layer_id,
                         ));
                     }
-                    if ui.button("澶嶅埗").clicked() {
+                    if ui.button("复制").clicked() {
                         self.copy_selection_to_clipboard(false);
                     }
-                    if ui.button("鍓垏").clicked() {
+                    if ui.button("剪切").clicked() {
                         self.copy_selection_to_clipboard(true);
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("绮樿创").clicked() {
+                    if ui.button("粘贴").clicked() {
                         self.paste_clipboard_to_active_layer();
                     }
-                    if ui.button("绮樿创涓烘柊鍥惧眰").clicked() {
+                    if ui.button("粘贴为新图层").clicked() {
                         self.paste_clipboard_to_new_layer();
                     }
                 });
                 if let Some(pixels) = &self.clipboard {
                     ui.label(format!(
-                        "鍓创鏉? {}x{} 鏉ヨ嚜鍥惧眰 {}",
+                        "剪贴板: {}x{} 来自图层 {}",
                         pixels.bounds.width, pixels.bounds.height, pixels.layer.0
                     ));
                 } else {
-                    ui.label("Clipboard: empty");
+                    ui.label("剪贴板: 空");
                 }
 
                 ui.separator();
 
-                if ui.button("娓呯┖褰撳墠鍥惧眰").clicked() {
+                if ui.button("清空当前图层").clicked() {
                     self.execute_canvas_command(CanvasCommand::ClearLayer(self.layer_id));
                 }
-                if ui.button("鎾ら攢").clicked() {
+                if ui.button("撤销").clicked() {
                     self.execute_canvas_command(CanvasCommand::Undo);
                 }
-                if ui.button("閲嶅仛").clicked() {
+                if ui.button("重做").clicked() {
                     self.execute_canvas_command(CanvasCommand::Redo);
                 }
 
                 ui.separator();
-                ui.heading("閲嶆斁缂洪櫡澶嶇幇");
-                ui.label("Run undo_by_gpu_replay repro on the current canvas.");
-                if ui.button("鍦ㄧ敾甯冧笂杩愯澶嶇幇").clicked() {
-                    self.run_defect_on_live_canvas(frame);
-                }
-                match &self.defect_test {
-                    Some(Ok((reproduced, report))) => {
-                        if *reproduced {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 60, 60),
-                                "Reproduced: undo_by_gpu_replay damaged other layers.",
-                            );
-                        } else {
-                            ui.colored_label(egui::Color32::from_rgb(60, 180, 90), "Not reproduced.");
-                        }
-                        ui.monospace(report);
-                    }
-                    Some(Err(error)) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 60, 60),
-                            format!("閿欒: {error}"),
-                        );
-                    }
-                    None => {}
-                }
+                ui.label("使用鼠标或数位板输入。");
 
                 ui.separator();
-                ui.label("Use mouse or tablet input.");
-
-                ui.separator();
-                ui.heading("鏂板缓鐢诲竷");
+                ui.heading("新建画布");
                 ui.horizontal(|ui| {
-                    ui.label("W");
+                    ui.label("宽");
                     ui.add(egui::DragValue::new(&mut self.new_canvas_width).range(1..=8192));
-                    ui.label("H");
+                    ui.label("高");
                     ui.add(egui::DragValue::new(&mut self.new_canvas_height).range(1..=8192));
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Tile");
+                    ui.label("分块");
                     ui.add(egui::DragValue::new(&mut self.new_canvas_tile_size).range(1..=1024));
-                    if ui.button("鍒涘缓").clicked() {
+                    if ui.button("创建").clicked() {
                         self.create_new_canvas(frame);
                     }
                 });
                 ui.label(format!(
-                    "褰撳墠鐢诲竷: {} x {}",
+                    "当前画布: {} x {}",
                     self.canvas_width as u32, self.canvas_height as u32
                 ));
 
                 ui.separator();
-                ui.heading("缂╂斁");
-                ui.add(egui::Slider::new(&mut self.zoom, 1.0..=32.0).text("缂╂斁"));
+                ui.heading("缩放");
+                ui.add(egui::Slider::new(&mut self.zoom, 1.0..=32.0).text("缩放"));
                 ui.horizontal(|ui| {
-                    if ui.button("閫傚簲").clicked() {
+                    if ui.button("适应").clicked() {
                         self.zoom = 1.0;
                         self.pan = egui::Vec2::ZERO;
                     }
@@ -1553,31 +1577,79 @@ impl eframe::App for CanvasApp {
                         self.zoom = 16.0;
                     }
                 });
-                ui.label("Mouse wheel zoom");
-                ui.label("Right drag to pan");
+                ui.label("鼠标滚轮缩放");
+                ui.label("右键拖拽平移");
 
                 ui.separator();
                 self.show_layer_panel(ui);
 
                 ui.separator();
-                ui.heading("Input audit");
-                ui.checkbox(&mut self.debug_overlay, "Show raw input overlay");
+                ui.heading("输入审计");
+                ui.checkbox(&mut self.debug_overlay, "显示原始输入叠加层");
                 let a = &self.audit;
                 let rate = if a.frames > 0 {
                     f64::from(a.raw_events) / f64::from(a.frames)
                 } else {
                     0.0
                 };
-                ui.label(format!("甯ф暟: {}", a.frames));
-                ui.label(format!("鍘熷浜嬩欢: {}", a.raw_events));
-                ui.label(format!("姣忓抚浜嬩欢: {rate:.2}"));
-                ui.label(format!("Max gap: {:.1}px", a.max_event_gap));
-                ui.label(format!("骞冲潎闂磋窛: {:.1}px", a.avg_event_gap()));
+                ui.label(format!("帧数: {}", a.frames));
+                ui.label(format!("原始事件: {}", a.raw_events));
+                ui.label(format!("每帧事件: {rate:.2}"));
+                ui.label(format!("最大间距: {:.1}px", a.max_event_gap));
+                ui.label(format!("平均间距: {:.1}px", a.avg_event_gap()));
                 ui.label(format!(
-                    "Frame dt: {:.1}ms (max {:.1})",
+                    "帧间隔: {:.1}ms（最大 {:.1}）",
                     a.last_frame_dt, a.max_frame_dt
                 ));
-                ui.label("Red = raw input points");
+                ui.label("红色 = 原始输入点");
+
+                ui.separator();
+                ui.heading("绘画记录");
+                let mut trace_changed = ui.checkbox(&mut self.trace_enabled, "启用记录").changed();
+                egui::ComboBox::from_label("记录等级")
+                    .selected_text(capture_level_label(self.trace_level))
+                    .show_ui(ui, |ui| {
+                        for level in CAPTURE_LEVELS {
+                            trace_changed |= ui
+                                .selectable_value(
+                                    &mut self.trace_level,
+                                    level,
+                                    capture_level_label(level),
+                                )
+                                .changed();
+                        }
+                    });
+                trace_changed |= ui
+                    .add(egui::Slider::new(&mut self.trace_budget_mb, 1..=128).text("会话预算 MB"))
+                    .changed();
+                if trace_changed {
+                    self.apply_trace_config();
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("重新开始记录").clicked() {
+                        self.trace_enabled = true;
+                        self.apply_trace_config();
+                    }
+                    if ui.button("停止记录").clicked() {
+                        self.trace_enabled = false;
+                        self.apply_trace_config();
+                    }
+                });
+                if ui.button("通过记录重构并校验").clicked() {
+                    self.rebuild_from_trace(frame);
+                }
+                let has_current_trace = self.core.lock().unwrap().session_trace().is_some();
+                ui.label(trace_status_label(
+                    self.trace_enabled,
+                    has_current_trace,
+                    self.last_trace.is_some(),
+                ));
+                if let Some(report) = self.trace_report() {
+                    ui.label(trace_report_summary(&report));
+                }
+                if let Some(result) = &self.trace_rebuild_result {
+                    ui.label(result);
+                }
             });
         });
 
@@ -1671,9 +1743,15 @@ impl eframe::App for CanvasApp {
                                 color: self.color(),
                                 first_point: p,
                             });
-                            if let Ok(CommandOutput::StrokeStarted { id }) = core.execute(&command)
-                            {
-                                self.active_stroke = Some(id);
+                            match core.execute(&command) {
+                                Ok(CommandOutput::StrokeStarted { id }) => {
+                                    self.active_stroke = Some(id);
+                                    self.last_error = None;
+                                }
+                                Ok(_) => {
+                                    self.last_error = Some("画笔命令未能开始笔画".to_owned());
+                                }
+                                Err(error) => self.last_error = Some(error.to_string()),
                             }
                         }
                         ToolMode::RectSelection => {
@@ -1752,8 +1830,13 @@ impl eframe::App for CanvasApp {
                                 stroke: id,
                                 points: batch,
                             });
-                            let _ = core.execute(&command);
-                            Self::refresh(&mut core);
+                            match core
+                                .execute(&command)
+                                .and_then(|_| Self::refresh(&mut core))
+                            {
+                                Ok(()) => self.last_error = None,
+                                Err(error) => self.last_error = Some(error.to_string()),
+                            }
                         }
                     }
                     ToolMode::RectSelection => {
@@ -1785,8 +1868,13 @@ impl eframe::App for CanvasApp {
                     ToolMode::Brush => {
                         if let Some(id) = self.active_stroke.take() {
                             let mut core = self.core.lock().unwrap();
-                            let _ = core.execute(&CanvasCommand::EndStroke(id));
-                            Self::refresh(&mut core);
+                            match core
+                                .execute(&CanvasCommand::EndStroke(id))
+                                .and_then(|_| Self::refresh(&mut core))
+                            {
+                                Ok(()) => self.last_error = None,
+                                Err(error) => self.last_error = Some(error.to_string()),
+                            }
                         }
                     }
                     ToolMode::RectSelection => {
@@ -1921,8 +2009,8 @@ impl eframe::App for CanvasApp {
                         rect.min.x + (tip.x - self.pan.x) * display_scale,
                         rect.min.y + (tip.y - self.pan.y) * display_scale,
                     );
-                    // 闁哄牆顦遍弲顐﹀箒閹烘せ鍋撻悢宄邦唺濠㈣埖鐗楃敮褰掓晬濮橀鏆曟繛鏉戭儐濡炲倿宕?~1.5 閻㈩垎宥囩闁圭顦甸埀顒傚枎鐎硅櫕寰勮閻剟姊介幇顒傜暯
-                    let horizon = 0.024_f32; // 缂佸甯槐婵堢棯?1.5 閻?@60fps
+                    // Match the core prediction horizon at about 1.5 frames at 60fps.
+                    let horizon = 0.024_f32;
                     let speed = self.pred_vel.length();
                     let max_ext = (self.brush_radius * 4.0).max(24.0);
                     let mut ext = self.pred_vel * horizon;
@@ -1985,3 +2073,218 @@ impl eframe::App for CanvasApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_level_labels_are_chinese_and_explicit_about_degradation() {
+        assert_eq!(
+            capture_level_label(CaptureLevel::L0Structure),
+            "L0 结构事件"
+        );
+        assert_eq!(
+            capture_level_label(CaptureLevel::L1PointStream),
+            "L1 笔触点流"
+        );
+        assert!(capture_level_label(CaptureLevel::L2PixelDelta).contains("当前降级"));
+        assert!(capture_level_label(CaptureLevel::L3SparseCheckpoint).contains("当前降级"));
+    }
+
+    #[test]
+    fn capture_config_is_conservative_for_test_app() {
+        let disabled = capture_config(false, CaptureLevel::L1PointStream, 0);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.level, CaptureLevel::L1PointStream);
+        assert_eq!(disabled.max_bytes_per_session, 1024 * 1024);
+        assert!(!disabled.allow_gpu_readback);
+
+        let enabled = capture_config(true, CaptureLevel::L2PixelDelta, 16);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.level, CaptureLevel::L2PixelDelta);
+        assert_eq!(enabled.max_bytes_per_session, 16 * 1024 * 1024);
+        assert!(!enabled.allow_gpu_readback);
+    }
+
+    #[test]
+    fn initial_capture_config_enables_recording_for_test_app() {
+        let capture = initial_capture_config();
+        assert!(capture.enabled);
+        assert_eq!(capture.level, CaptureLevel::L1PointStream);
+        assert!(!capture.allow_gpu_readback);
+    }
+
+    #[test]
+    fn trace_status_label_distinguishes_current_and_cached_records() {
+        assert_eq!(trace_status_label(true, true, false), "正在记录当前绘画");
+        assert_eq!(
+            trace_status_label(false, false, true),
+            "记录已停止，可重构上次记录"
+        );
+        assert_eq!(trace_status_label(false, false, false), "还没有可用记录");
+    }
+
+    #[test]
+    fn trace_report_summary_contains_recording_counters() {
+        let report = TraceReport {
+            command_count: 4,
+            stroke_count: 2,
+            point_count: 1000,
+            layer_event_count: 1,
+            selection_event_count: 3,
+            dirty_summary_count: 2,
+            resource_reference_count: 1,
+            degradation_count: 1,
+            estimated_bytes: 4096,
+        };
+        let summary = trace_report_summary(&report);
+        assert!(summary.contains("命令=4"));
+        assert!(summary.contains("点=1000"));
+        assert!(summary.contains("资源引用=1"));
+        assert!(summary.contains("降级=1"));
+        assert!(summary.contains("估算=4 KB"));
+    }
+
+    #[test]
+    fn max_pixel_abs_diff_reports_mismatch_and_rejects_different_lengths() {
+        let left = vec![[0.0, 0.5, 1.0, 1.0], [0.25, 0.0, 0.0, 1.0]];
+        let right = vec![[0.0, 0.25, 1.0, 1.0], [0.75, 0.0, 0.0, 1.0]];
+        let diff = max_pixel_abs_diff(&left, &right).expect("same length");
+        assert!((diff - 0.5).abs() <= f32::EPSILON);
+        assert!(max_pixel_abs_diff(&left, &right[..1]).is_none());
+    }
+
+    #[test]
+    fn trace_rebuild_summary_reports_replay_result() {
+        let mut trace = SessionTrace::new(
+            CanvasConfig::default(),
+            capture_config(true, CaptureLevel::L1PointStream, 8),
+        );
+        trace.report.command_count = 12;
+        trace.report.point_count = 345;
+        trace.report.resource_reference_count = 1;
+        trace.report.degradation_count = 2;
+        let summary = trace_rebuild_summary(&trace, 0.00125);
+        assert!(summary.contains("已重构到画布"));
+        assert!(summary.contains("命令=12"));
+        assert!(summary.contains("点=345"));
+        assert!(summary.contains("资源引用=1"));
+        assert!(summary.contains("降级=2"));
+        assert!(summary.contains("重构前最大像素误差=0.001250"));
+    }
+
+    #[test]
+    fn trace_base_layer_commands_restore_existing_scene_layers() {
+        let mut child = LayerSnapshot {
+            spec: LayerSpec::new(LayerId(2)),
+            parent: Some(LayerId(1)),
+            group_mode: LayerGroupMode::Isolated,
+            tile_count: 3,
+        };
+        child.spec.opacity = 0.5;
+        let commands = trace_base_layer_commands(&[
+            LayerSnapshot {
+                spec: LayerSpec::new(LayerId(1)),
+                parent: None,
+                group_mode: LayerGroupMode::PassThrough,
+                tile_count: 0,
+            },
+            child,
+        ]);
+        assert!(matches!(
+            &commands[0],
+            CanvasCommand::AddLayer(spec) if spec.id == LayerId(1)
+        ));
+        assert!(matches!(
+            &commands[1],
+            CanvasCommand::AddLayer(spec) if spec.id == LayerId(2) && (spec.opacity - 0.5).abs() <= f32::EPSILON
+        ));
+        assert!(matches!(
+            &commands[2],
+            CanvasCommand::SetLayerParent {
+                id: LayerId(2),
+                parent: Some(LayerId(1)),
+            }
+        ));
+        assert!(matches!(
+            &commands[3],
+            CanvasCommand::SetLayerGroupMode {
+                id: LayerId(2),
+                mode: LayerGroupMode::Isolated,
+            }
+        ));
+    }
+
+    #[test]
+    fn replay_stroke_commands_remap_streaming_stroke_ids() {
+        let mut stroke_id_map = HashMap::new();
+        stroke_id_map.insert(StrokeId(29), StrokeId(1));
+
+        let append = remap_replay_stroke_command(
+            &CanvasCommand::AppendStroke(AppendStrokeCommand {
+                stroke: StrokeId(29),
+                points: vec![StrokePoint {
+                    x: 1.0,
+                    y: 2.0,
+                    pressure: 1.0,
+                }],
+            }),
+            &stroke_id_map,
+        );
+        assert!(matches!(
+            append,
+            CanvasCommand::AppendStroke(AppendStrokeCommand {
+                stroke: StrokeId(1),
+                ..
+            })
+        ));
+
+        let end =
+            remap_replay_stroke_command(&CanvasCommand::EndStroke(StrokeId(29)), &stroke_id_map);
+        assert!(matches!(end, CanvasCommand::EndStroke(StrokeId(1))));
+    }
+
+    #[test]
+    fn trace_stroke_begin_after_finds_original_streaming_id() {
+        let mut trace = SessionTrace::new(
+            CanvasConfig::default(),
+            capture_config(true, CaptureLevel::L1PointStream, 8),
+        );
+        trace.events.push(canvas_core::TraceEvent {
+            sequence: 0,
+            estimated_bytes: 1,
+            kind: canvas_core::TraceEventKind::Command(canvas_core::TraceCommandEvent {
+                position: 0,
+                kind: canvas_core::TraceCommandKind::BeginStroke,
+                replay: None,
+            }),
+        });
+        trace.events.push(canvas_core::TraceEvent {
+            sequence: 1,
+            estimated_bytes: 1,
+            kind: canvas_core::TraceEventKind::StrokeBegin(canvas_core::TraceStrokeBegin {
+                stroke: StrokeId(29),
+                layer: LayerId(1),
+                mode: BrushMode::Paint,
+                radius: 2.0,
+                color: Color::rgba(0.0, 0.0, 0.0, 1.0),
+                first_point: StrokePoint {
+                    x: 1.0,
+                    y: 1.0,
+                    pressure: 1.0,
+                },
+                selection_generation: 0,
+            }),
+        });
+        assert_eq!(trace_stroke_begin_after(&trace, 0), Some(StrokeId(29)));
+    }
+
+    #[test]
+    fn capture_level_list_matches_supported_ui_choices() {
+        assert_eq!(CAPTURE_LEVELS.len(), 4);
+        assert_eq!(CAPTURE_LEVELS[0], CaptureLevel::L0Structure);
+        assert_eq!(CAPTURE_LEVELS[1], CaptureLevel::L1PointStream);
+        assert_eq!(CAPTURE_LEVELS[2], CaptureLevel::L2PixelDelta);
+        assert_eq!(CAPTURE_LEVELS[3], CaptureLevel::L3SparseCheckpoint);
+    }
+}

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-canvas_core = { path = "../../canva" }
+canvas_core = { path = "../canva" }
 eframe = { version = "0.34", features = ["wgpu"] }
 egui = "0.34"
 pollster = "0.4"
@@ -13,5 +13,20 @@ pollster = "0.4"
 unsafe_code = "warn"
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Demo UI code converts between egui f32 coordinates and canvas integer
+# coordinates at interaction boundaries.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# The app state mirrors independent UI toggles, and the egui panels are kept
+# linear so the demo stays easy to inspect.
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+# Commands are intentionally accepted by value at call sites so temporary
+# command builders remain simple.
+needless_pass_by_value = "allow"
+# `CanvasCore::debug_readback` is async for API portability but blocks on native
+# wgpu; the demo invokes it synchronously while holding the app mutex.
+await_holding_lock = "allow"
