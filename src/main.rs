@@ -301,9 +301,11 @@ fn initial_capture_config() -> DataCaptureConfig {
 
 fn trace_report_summary(report: &TraceReport) -> String {
     format!(
-        "命令={}，笔触={}，点={}，图层事件={}，选区事件={}，dirty 摘要={}，资源引用={}，降级={}，估算={} KB",
+        "事件={}，命令={}，笔触={}，追加={}，点={}，图层事件={}，选区事件={}，dirty 摘要={}，资源引用={}，降级={}，估算={} KB",
+        report.event_count,
         report.command_count,
         report.stroke_count,
+        report.stroke_append_count,
         report.point_count,
         report.layer_event_count,
         report.selection_event_count,
@@ -2127,8 +2129,10 @@ mod tests {
     #[test]
     fn trace_report_summary_contains_recording_counters() {
         let report = TraceReport {
+            event_count: 12,
             command_count: 4,
             stroke_count: 2,
+            stroke_append_count: 3,
             point_count: 1000,
             layer_event_count: 1,
             selection_event_count: 3,
@@ -2138,7 +2142,9 @@ mod tests {
             estimated_bytes: 4096,
         };
         let summary = trace_report_summary(&report);
+        assert!(summary.contains("事件=12"));
         assert!(summary.contains("命令=4"));
+        assert!(summary.contains("追加=3"));
         assert!(summary.contains("点=1000"));
         assert!(summary.contains("资源引用=1"));
         assert!(summary.contains("降级=1"));
