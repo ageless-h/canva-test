@@ -1,10 +1,10 @@
 use canvas_core::{
-    AppendStrokeCommand, BeginStrokeCommand, BlendMode, BrushDynamics, BrushMode, BrushStamp,
-    BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore, CanvasError,
-    CaptureLevel, Color, CommandOutput, DataCaptureConfig, InputDeviceCapabilities, LayerGroupMode,
-    LayerId, LayerSnapshot, LayerSpec, PressureCurve, SelectedPixels, SelectionCombineMode,
-    SelectionPoint, SelectionPolygon, SelectionRect, SessionTrace, StabilizerConfig,
-    StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig, TraceReport,
+    AppendStrokeCommand, BeginStrokeCommand, BlendMode, BrushCommand, BrushDynamics, BrushMode,
+    BrushStamp, BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore,
+    CanvasError, CaptureLevel, Color, CommandOutput, DataCaptureConfig, InputDeviceCapabilities,
+    LayerGroupMode, LayerId, LayerSnapshot, LayerSpec, PressureCurve, SelectedPixels,
+    SelectionCombineMode, SelectionPoint, SelectionPolygon, SelectionRect, SessionTrace,
+    StabilizerConfig, StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig, TraceReport,
 };
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
@@ -339,6 +339,36 @@ fn trace_rebuild_summary(trace: &SessionTrace, max_diff: f32) -> String {
     )
 }
 
+fn trace_rebuild_error_message(error: &CanvasError) -> String {
+    match error {
+        CanvasError::MissingLayer(layer) => format!("重构失败：图层 {layer:?} 不存在"),
+        CanvasError::MissingStroke(stroke) => format!("重构失败：笔触 {stroke:?} 不存在"),
+        CanvasError::MissingTraceResource(id) if id.starts_with("测试程序") => {
+            format!("重构失败：{id}")
+        }
+        CanvasError::MissingTraceResource(_) | CanvasError::InvalidTraceResource(_) => {
+            format!("重构失败：{}", error.diagnostic_message_zh())
+        }
+        _ => format!("重构失败：{}", error.diagnostic_message_zh()),
+    }
+}
+
+fn trace_rebuild_unavailable_message(
+    enabled: bool,
+    has_current_trace: bool,
+    has_cached_trace: bool,
+) -> &'static str {
+    match (enabled, has_current_trace, has_cached_trace) {
+        (_, true, _) | (_, _, true) => "已有可重构记录",
+        (false, false, false) => "记录未启用，无法重构",
+        (true, false, false) => "记录为空，无法重构",
+    }
+}
+
+fn trace_texture_registration_error_message(error: impl std::fmt::Display) -> String {
+    format!("重构已完成，但显示纹理注册失败：{error}")
+}
+
 fn trace_status_label(
     enabled: bool,
     has_current_trace: bool,
@@ -374,6 +404,24 @@ fn trace_base_layer_commands(layers: &[LayerSnapshot]) -> Vec<CanvasCommand> {
     commands
 }
 
+fn trace_replay_command_payload(
+    command: &canvas_core::TraceCommandEvent,
+) -> Result<&CanvasCommand, CanvasError> {
+    match &command.replay {
+        Some(canvas_core::TraceReplayCommand::Command(command)) => Ok(command),
+        Some(canvas_core::TraceReplayCommand::MissingResource { .. }) => {
+            Err(CanvasError::MissingTraceResource(format!(
+                "测试程序重构暂不解析外部资源引用；{}",
+                command.diagnostic_message_zh()
+            )))
+        }
+        None => Err(CanvasError::MissingTraceResource(format!(
+            "测试程序重构缺少可执行 command replay payload；{}",
+            command.diagnostic_message_zh()
+        ))),
+    }
+}
+
 fn replay_trace_commands_into_core(
     core: &mut CanvasCore,
     trace: &SessionTrace,
@@ -391,11 +439,7 @@ fn replay_trace_commands_into_core(
         let canvas_core::TraceEventKind::Command(command) = &event.kind else {
             continue;
         };
-        let Some(canvas_core::TraceReplayCommand::Command(command)) = &command.replay else {
-            return Err(CanvasError::MissingTraceResource(
-                "测试程序重构暂不解析外部资源引用".to_owned(),
-            ));
-        };
+        let command = trace_replay_command_payload(command)?;
         let command = remap_replay_stroke_command(command, &stroke_id_map);
         match &command {
             CanvasCommand::AddLayer(spec)
@@ -1024,7 +1068,14 @@ impl CanvasApp {
             .cloned()
             .or_else(|| self.last_trace.clone());
         let Some(trace) = trace else {
-            self.trace_rebuild_result = Some("还没有可重构的记录".to_owned());
+            self.trace_rebuild_result = Some(
+                trace_rebuild_unavailable_message(
+                    self.trace_enabled,
+                    false,
+                    self.last_trace.is_some(),
+                )
+                .to_owned(),
+            );
             return;
         };
 
@@ -1072,37 +1123,40 @@ impl CanvasApp {
                 self.trace_enabled = false;
                 self.trace_base_layers = self.core.lock().unwrap().layer_snapshot();
                 if let Err(error) = self.register_presentation_texture(render_state) {
-                    format!("重构已完成，但显示纹理注册失败：{error}")
+                    trace_texture_registration_error_message(error)
                 } else {
                     trace_rebuild_summary(&trace, max_diff)
                 }
             }
-            Err(error) => format!("重构失败：{error}"),
+            Err(error) => trace_rebuild_error_message(&error),
         });
     }
 }
 
-fn install_chinese_fonts(ctx: &egui::Context) {
-    const FONT_PATHS: &[&str] = &[
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-        "/System/Library/Fonts/Supplemental/Songti.ttc",
-        "/Library/Fonts/Arial Unicode.ttf",
-        "/Library/Fonts/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\msyh.ttf",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ];
+const CHINESE_FONT_PATHS: &[&str] = &[
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/Supplemental/Songti.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/Library/Fonts/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyh.ttf",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+];
 
-    let Some((font_path, font_bytes)) = FONT_PATHS
+const CHINESE_FONT_MISSING_WARNING: &str =
+    "未找到可用中文字体，测试程序中文界面可能显示为方框或乱码";
+
+fn install_chinese_fonts(ctx: &egui::Context) {
+    let Some((font_path, font_bytes)) = CHINESE_FONT_PATHS
         .iter()
         .find_map(|path| fs::read(path).ok().map(|bytes| (*path, bytes)))
     else {
-        eprintln!("未找到可用中文字体，测试程序中文界面可能显示为方框或乱码");
+        eprintln!("{CHINESE_FONT_MISSING_WARNING}");
         return;
     };
 
@@ -2117,6 +2171,33 @@ mod tests {
     }
 
     #[test]
+    fn chinese_font_candidates_cover_macos_and_fallback_platforms() {
+        assert!(
+            CHINESE_FONT_PATHS
+                .iter()
+                .any(|path| path.starts_with("/System/Library/Fonts/"))
+        );
+        assert!(
+            CHINESE_FONT_PATHS
+                .iter()
+                .any(|path| path.contains("Hiragino"))
+        );
+        assert!(
+            CHINESE_FONT_PATHS
+                .iter()
+                .any(|path| path.contains("NotoSansCJK"))
+        );
+        assert!(CHINESE_FONT_PATHS.iter().any(|path| path.contains("wqy")));
+        assert!(
+            CHINESE_FONT_PATHS
+                .iter()
+                .any(|path| path.contains(r"C:\Windows\Fonts"))
+        );
+        assert!(CHINESE_FONT_MISSING_WARNING.contains("中文字体"));
+        assert!(CHINESE_FONT_MISSING_WARNING.contains("乱码"));
+    }
+
+    #[test]
     fn trace_status_label_distinguishes_current_and_cached_records() {
         assert_eq!(trace_status_label(true, true, false), "正在记录当前绘画");
         assert_eq!(
@@ -2124,6 +2205,32 @@ mod tests {
             "记录已停止，可重构上次记录"
         );
         assert_eq!(trace_status_label(false, false, false), "还没有可用记录");
+    }
+
+    #[test]
+    fn trace_rebuild_unavailable_message_distinguishes_empty_states() {
+        assert_eq!(
+            trace_rebuild_unavailable_message(false, false, false),
+            "记录未启用，无法重构"
+        );
+        assert_eq!(
+            trace_rebuild_unavailable_message(true, false, false),
+            "记录为空，无法重构"
+        );
+        assert_eq!(
+            trace_rebuild_unavailable_message(false, false, true),
+            "已有可重构记录"
+        );
+        assert_eq!(
+            trace_rebuild_unavailable_message(true, true, false),
+            "已有可重构记录"
+        );
+    }
+
+    #[test]
+    fn trace_texture_registration_error_message_reports_display_failure() {
+        let message = trace_texture_registration_error_message("纹理无效");
+        assert_eq!(message, "重构已完成，但显示纹理注册失败：纹理无效");
     }
 
     #[test]
@@ -2138,7 +2245,11 @@ mod tests {
             selection_event_count: 3,
             dirty_summary_count: 2,
             resource_reference_count: 1,
+            resource_reference_bytes: 256,
+            pixel_delta_payload_bytes: 0,
+            checkpoint_payload_bytes: 0,
             degradation_count: 1,
+            delta_encoded_estimated_bytes: 2048,
             estimated_bytes: 4096,
         };
         let summary = trace_report_summary(&report);
@@ -2149,6 +2260,34 @@ mod tests {
         assert!(summary.contains("资源引用=1"));
         assert!(summary.contains("降级=1"));
         assert!(summary.contains("估算=4 KB"));
+    }
+
+    #[test]
+    fn trace_rebuild_error_message_localizes_expected_failures() {
+        assert_eq!(
+            trace_rebuild_error_message(&CanvasError::MissingLayer(LayerId(7))),
+            "重构失败：图层 LayerId(7) 不存在"
+        );
+        assert_eq!(
+            trace_rebuild_error_message(&CanvasError::MissingStroke(StrokeId(29))),
+            "重构失败：笔触 StrokeId(29) 不存在"
+        );
+        assert_eq!(
+            trace_rebuild_error_message(&CanvasError::MissingTraceResource(
+                "paste:fixture".to_owned()
+            )),
+            "重构失败：CanvasCore 错误：trace 重放缺少资源引用 paste:fixture"
+        );
+        assert_eq!(
+            trace_rebuild_error_message(&CanvasError::InvalidTraceResource(
+                "paste:fixture".to_owned()
+            )),
+            "重构失败：CanvasCore 错误：trace 重放资源引用与 resolver 返回命令不匹配 paste:fixture"
+        );
+        assert_eq!(
+            trace_rebuild_error_message(&CanvasError::InvalidCanvasSize),
+            "重构失败：CanvasCore 错误：画布尺寸必须非零"
+        );
     }
 
     #[test]
@@ -2219,6 +2358,88 @@ mod tests {
                 mode: LayerGroupMode::Isolated,
             }
         ));
+    }
+
+    #[test]
+    fn trace_replay_command_payload_reports_resource_resolver_state() {
+        let brush = CanvasCommand::Brush(BrushCommand {
+            layer: LayerId(1),
+            mode: BrushMode::Paint,
+            radius: 2.0,
+            color: Color::rgba(0.0, 0.0, 0.0, 1.0),
+            points: vec![StrokePoint {
+                x: 1.0,
+                y: 2.0,
+                pressure: 1.0,
+            }],
+        });
+        let command = canvas_core::TraceCommandEvent {
+            position: 0,
+            kind: canvas_core::TraceCommandKind::Brush,
+            replay: Some(canvas_core::TraceReplayCommand::Command(brush)),
+        };
+        assert!(matches!(
+            trace_replay_command_payload(&command),
+            Ok(CanvasCommand::Brush(_))
+        ));
+
+        let resource = canvas_core::TraceResourceReference {
+            kind: canvas_core::TraceResourceKind::PastePixels,
+            id: "paste:fixture".to_owned(),
+            byte_len: 64,
+            checksum: Some(42),
+            width: Some(2),
+            height: Some(2),
+            pixel_format: Some(canvas_core::TraceResourcePixelFormat::Rgba32FloatLinear),
+            lifecycle: canvas_core::TraceResourceLifecycle::ExternalResolverOwned,
+        };
+        let missing_resource = canvas_core::TraceCommandEvent {
+            position: 1,
+            kind: canvas_core::TraceCommandKind::PastePixels,
+            replay: Some(canvas_core::TraceReplayCommand::MissingResource {
+                resource,
+                original_kind: canvas_core::TraceCommandKind::PastePixels,
+            }),
+        };
+        let error = trace_replay_command_payload(&missing_resource)
+            .expect_err("resource placeholder should require a resolver");
+        assert!(matches!(error, CanvasError::MissingTraceResource(_)));
+        let message = trace_rebuild_error_message(&error);
+        for expected in [
+            "重构失败：测试程序重构暂不解析外部资源引用",
+            "trace command：position=1",
+            "类型=粘贴像素",
+            "replay payload=资源占位",
+            "trace 资源引用",
+            "paste:fixture",
+            "尺寸=2x2",
+            "checksum=42",
+        ] {
+            assert!(
+                message.contains(expected),
+                "资源占位重构错误 `{message}` 应包含 `{expected}`"
+            );
+        }
+
+        let missing_payload = canvas_core::TraceCommandEvent {
+            position: 2,
+            kind: canvas_core::TraceCommandKind::Brush,
+            replay: None,
+        };
+        let error = trace_replay_command_payload(&missing_payload)
+            .expect_err("missing replay payload should be surfaced");
+        let message = trace_rebuild_error_message(&error);
+        for expected in [
+            "重构失败：测试程序重构缺少可执行 command replay payload",
+            "trace command：position=2",
+            "类型=笔刷",
+            "无 replay payload",
+        ] {
+            assert!(
+                message.contains(expected),
+                "缺失 replay payload 错误 `{message}` 应包含 `{expected}`"
+            );
+        }
     }
 
     #[test]
