@@ -3,12 +3,12 @@ use canva_input::{
     StylusSample,
 };
 use canvas_core::{
-    AppendStrokeCommand, BeginStrokeCommand, BlendMode, BrushDynamics, BrushMode, BrushStamp,
-    BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore, CanvasError,
-    CaptureLevel, Color, CommandOutput, DataCaptureConfig, InputDeviceCapabilities, LayerGroupMode,
-    LayerId, LayerSnapshot, LayerSpec, PressureCurve, SelectedPixels, SelectionCombineMode,
-    SelectionPoint, SelectionPolygon, SelectionRect, SessionTrace, StabilizerConfig,
-    StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig, TraceReport,
+    AppendStrokeCommand, BeginStrokeCommand, BlendMode, BrushCommand, BrushDynamics, BrushMode,
+    BrushStamp, BrushStampKind, BrushStampTextureId, CanvasCommand, CanvasConfig, CanvasCore,
+    CanvasError, CaptureLevel, Color, CommandOutput, DataCaptureConfig, InputDeviceCapabilities,
+    LayerGroupMode, LayerId, LayerSnapshot, LayerSpec, PressureCurve, SelectedPixels,
+    SelectionCombineMode, SelectionPoint, SelectionPolygon, SelectionRect, SessionTrace,
+    StabilizerConfig, StabilizerMode, StrokeId, StrokePoint, StrokePredictionConfig, TraceReport,
 };
 use eframe::egui;
 use eframe::egui_wgpu::wgpu;
@@ -145,11 +145,20 @@ enum StrokeInputSource {
 struct InputPoint {
     point: StrokePoint,
     source: StrokeInputSource,
+    pressure_from_device: bool,
 }
 
 struct InputBatch {
     points: Vec<StrokePoint>,
     source: StrokeInputSource,
+    first_pressure_from_device: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TapCandidate {
+    anchor: StrokePoint,
+    max_pressure: f32,
+    max_distance: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +257,7 @@ struct CanvasApp {
     active_stroke: Option<StrokeId>,
     active_stroke_input_source: Option<StrokeInputSource>,
     active_stroke_dispatched: bool,
+    active_tap_candidate: Option<TapCandidate>,
     smooth_strength: f32,
     stab_mode: StabilizerMode,
     /// Last cursor position used for preview prediction and input audit deltas.
@@ -344,6 +354,23 @@ fn stroke_point_distance(a: StrokePoint, b: StrokePoint) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
+fn tap_jitter_threshold(brush_radius: f32) -> f32 {
+    (brush_radius * 0.2).clamp(2.5, 5.0)
+}
+
+fn points_within_tap_jitter(
+    candidate: TapCandidate,
+    points: &[StrokePoint],
+    brush_radius: f32,
+) -> bool {
+    let threshold = tap_jitter_threshold(brush_radius);
+    candidate.max_distance <= threshold
+        && points
+            .iter()
+            .copied()
+            .all(|point| stroke_point_distance(candidate.anchor, point) <= threshold)
+}
+
 fn should_reanchor_pointer_begin_to_touch(
     source: StrokeInputSource,
     active_source: Option<StrokeInputSource>,
@@ -363,6 +390,20 @@ fn should_reanchor_pointer_begin_to_touch(
     };
     let threshold = (brush_radius * 2.0).max(16.0);
     stroke_point_distance(begin, first) > threshold
+}
+
+fn should_reanchor_touch_begin_pressure(
+    source: StrokeInputSource,
+    active_source: Option<StrokeInputSource>,
+    active_dispatched: bool,
+    begin_pressure_from_device: bool,
+    first_pressure_from_device: bool,
+) -> bool {
+    source == StrokeInputSource::Touch
+        && active_source == Some(StrokeInputSource::Touch)
+        && !active_dispatched
+        && !begin_pressure_from_device
+        && first_pressure_from_device
 }
 
 fn stroke_point_debug(point: Option<StrokePoint>) -> String {
@@ -671,6 +712,7 @@ impl CanvasApp {
             active_stroke: None,
             active_stroke_input_source: None,
             active_stroke_dispatched: false,
+            active_tap_candidate: None,
             smooth_strength: 0.5,
             stab_mode: StabilizerMode::Adaptive,
             last_cursor: None,
@@ -1180,21 +1222,21 @@ impl CanvasApp {
     ) -> InputPoint {
         let (touch_events, time_seconds) = Self::touch_events(ui);
         if let Some((pos, _, force)) = Self::touch_begin_event(&touch_events) {
+            let point =
+                self.input_stroke_point(pos, StylusPhase::Down, force, viewport, time_seconds, 1);
+            let pressure_from_device = Self::input_pressure(force).is_some();
             return InputPoint {
-                point: self.input_stroke_point(
-                    pos,
-                    StylusPhase::Down,
-                    force,
-                    viewport,
-                    time_seconds,
-                    1,
-                ),
+                point,
                 source: StrokeInputSource::Touch,
+                pressure_from_device,
             };
         }
+        let point = self.current_input_point(ui, fallback_pos, StylusPhase::Down, viewport);
+        let pressure_from_device = false;
         InputPoint {
-            point: self.current_input_point(ui, fallback_pos, StylusPhase::Down, viewport),
+            point,
             source: StrokeInputSource::PointerFallback,
+            pressure_from_device,
         }
     }
 
@@ -1249,22 +1291,28 @@ impl CanvasApp {
                 .filter(|(_, phase, _)| touch_phase_appends_to_active_stroke(*phase))
                 .collect::<Vec<_>>();
             let batch_size = touch_events.len();
-            let points: Vec<StrokePoint> = touch_events
-                .into_iter()
-                .map(|(pos, phase, force)| {
-                    let phase = match phase {
-                        egui::TouchPhase::Start => StylusPhase::Down,
-                        egui::TouchPhase::Move => StylusPhase::Move,
-                        egui::TouchPhase::End => StylusPhase::Up,
-                        egui::TouchPhase::Cancel => StylusPhase::Cancel,
-                    };
-                    self.input_stroke_point(pos, phase, force, viewport, time_seconds, batch_size)
-                })
-                .collect();
+            let mut points = Vec::with_capacity(batch_size);
+            let mut first_pressure_from_device = false;
+            for (pos, phase, force) in touch_events {
+                let pressure_from_device = Self::input_pressure(force).is_some();
+                let phase = match phase {
+                    egui::TouchPhase::Start => StylusPhase::Down,
+                    egui::TouchPhase::Move => StylusPhase::Move,
+                    egui::TouchPhase::End => StylusPhase::Up,
+                    egui::TouchPhase::Cancel => StylusPhase::Cancel,
+                };
+                let point =
+                    self.input_stroke_point(pos, phase, force, viewport, time_seconds, batch_size);
+                if points.is_empty() {
+                    first_pressure_from_device = pressure_from_device;
+                }
+                points.push(point);
+            }
             self.record_adapted_pressure_range(&points);
             return InputBatch {
                 points,
                 source: StrokeInputSource::Touch,
+                first_pressure_from_device,
             };
         }
 
@@ -1289,23 +1337,27 @@ impl CanvasApp {
         self.audit.last_raw_force_min = None;
         self.audit.last_raw_force_max = None;
         self.audit.last_raw_force_missing = 0;
-        let points: Vec<StrokePoint> = pointer_events
-            .into_iter()
-            .map(|pos| {
-                self.input_stroke_point(
-                    pos,
-                    StylusPhase::Move,
-                    None,
-                    viewport,
-                    time_seconds,
-                    batch_size,
-                )
-            })
-            .collect();
+        let mut points = Vec::with_capacity(batch_size);
+        let mut first_pressure_from_device = false;
+        for pos in pointer_events {
+            let point = self.input_stroke_point(
+                pos,
+                StylusPhase::Move,
+                None,
+                viewport,
+                time_seconds,
+                batch_size,
+            );
+            if points.is_empty() {
+                first_pressure_from_device = false;
+            }
+            points.push(point);
+        }
         self.record_adapted_pressure_range(&points);
         InputBatch {
             points,
             source: StrokeInputSource::PointerFallback,
+            first_pressure_from_device,
         }
     }
 
@@ -1324,7 +1376,25 @@ impl CanvasApp {
         )
     }
 
-    fn reanchor_active_stroke_to_touch(&mut self, first: StrokePoint) -> Result<(), String> {
+    fn should_reanchor_touch_begin_pressure(
+        &self,
+        source: StrokeInputSource,
+        first_pressure_from_device: bool,
+    ) -> bool {
+        should_reanchor_touch_begin_pressure(
+            source,
+            self.active_stroke_input_source,
+            self.active_stroke_dispatched,
+            self.audit.begin_pressure_from_device,
+            first_pressure_from_device,
+        )
+    }
+
+    fn reanchor_active_stroke_to_touch(
+        &mut self,
+        first: StrokePoint,
+        first_pressure_from_device: bool,
+    ) -> Result<(), String> {
         if let Some(id) = self.active_stroke.take() {
             let mut core = self.core.lock().unwrap();
             core.execute(&CanvasCommand::EndStroke(id))
@@ -1332,7 +1402,6 @@ impl CanvasApp {
         }
 
         self.sync_core_brush_settings();
-        let mut core = self.core.lock().unwrap();
         let command = CanvasCommand::BeginStroke(BeginStrokeCommand {
             layer: self.layer_id,
             mode: self.brush_mode,
@@ -1340,20 +1409,61 @@ impl CanvasApp {
             color: self.color(),
             first_point: first,
         });
-        match core.execute(&command).map_err(|error| error.to_string())? {
+        let output = {
+            let mut core = self.core.lock().unwrap();
+            core.execute(&command).map_err(|error| error.to_string())?
+        };
+        match output {
             CommandOutput::StrokeStarted { id } => {
                 self.active_stroke = Some(id);
                 self.active_stroke_input_source = Some(StrokeInputSource::Touch);
                 self.active_stroke_dispatched = false;
                 self.audit.begin_point = Some(first);
-                self.audit.begin_pressure_from_device = self.pressure_from_device;
+                self.audit.begin_pressure_from_device = first_pressure_from_device;
                 self.audit.begin_input_source = Some(StrokeInputSource::Touch);
                 self.audit.reanchored_touch_begins =
                     self.audit.reanchored_touch_begins.saturating_add(1);
+                self.begin_tap_candidate(first);
                 Ok(())
             }
             _ => Err("画笔命令未能重新开始笔画".to_owned()),
         }
+    }
+
+    fn begin_tap_candidate(&mut self, anchor: StrokePoint) {
+        self.active_tap_candidate = Some(TapCandidate {
+            anchor,
+            max_pressure: anchor.pressure.clamp(0.0, 1.0),
+            max_distance: 0.0,
+        });
+    }
+
+    fn reset_active_stroke_tracking(&mut self) {
+        self.active_stroke_input_source = None;
+        self.active_stroke_dispatched = false;
+        self.active_tap_candidate = None;
+    }
+
+    fn update_tap_candidate(&mut self, points: &[StrokePoint]) {
+        let Some(candidate) = self.active_tap_candidate.as_mut() else {
+            return;
+        };
+        for point in points.iter().copied() {
+            candidate.max_pressure = candidate.max_pressure.max(point.pressure.clamp(0.0, 1.0));
+            candidate.max_distance = candidate
+                .max_distance
+                .max(stroke_point_distance(candidate.anchor, point));
+        }
+    }
+
+    fn batch_is_tap_jitter(&self, source: StrokeInputSource, points: &[StrokePoint]) -> bool {
+        if self.active_stroke_dispatched || source != StrokeInputSource::Touch {
+            return false;
+        }
+        let Some(candidate) = self.active_tap_candidate else {
+            return false;
+        };
+        points_within_tap_jitter(candidate, points, self.brush_radius)
     }
 
     fn register_presentation_texture(
@@ -1412,8 +1522,7 @@ impl CanvasApp {
                 self.canvas_width = config.width as f32;
                 self.canvas_height = config.height as f32;
                 self.active_stroke = None;
-                self.active_stroke_input_source = None;
-                self.active_stroke_dispatched = false;
+                self.reset_active_stroke_tracking();
                 self.last_cursor = None;
                 self.pred_vel = egui::Vec2::ZERO;
                 self.zoom = 1.0;
@@ -2256,10 +2365,9 @@ impl eframe::App for CanvasApp {
                             let input = self.begin_input_point(ui, pos, viewport);
                             let p = input.point;
                             self.audit.begin_point = Some(p);
-                            self.audit.begin_pressure_from_device = self.pressure_from_device;
+                            self.audit.begin_pressure_from_device = input.pressure_from_device;
                             self.audit.begin_input_source = Some(input.source);
                             self.sync_core_brush_settings();
-                            let mut core = self.core.lock().unwrap();
                             let command = CanvasCommand::BeginStroke(BeginStrokeCommand {
                                 layer: self.layer_id,
                                 mode: self.brush_mode,
@@ -2267,23 +2375,26 @@ impl eframe::App for CanvasApp {
                                 color: self.color(),
                                 first_point: p,
                             });
-                            match core.execute(&command) {
+                            let output = {
+                                let mut core = self.core.lock().unwrap();
+                                core.execute(&command)
+                            };
+                            match output {
                                 Ok(CommandOutput::StrokeStarted { id }) => {
                                     self.active_stroke = Some(id);
                                     self.active_stroke_input_source = Some(input.source);
                                     self.active_stroke_dispatched = false;
+                                    self.begin_tap_candidate(p);
                                     self.last_error = None;
                                 }
                                 Ok(_) => {
                                     self.active_stroke = None;
-                                    self.active_stroke_input_source = None;
-                                    self.active_stroke_dispatched = false;
+                                    self.reset_active_stroke_tracking();
                                     self.last_error = Some("画笔命令未能开始笔画".to_owned());
                                 }
                                 Err(error) => {
                                     self.active_stroke = None;
-                                    self.active_stroke_input_source = None;
-                                    self.active_stroke_dispatched = false;
+                                    self.reset_active_stroke_tracking();
                                     self.last_error = Some(error.to_string());
                                 }
                             }
@@ -2330,6 +2441,8 @@ impl eframe::App for CanvasApp {
 
                         let input_batch = self.input_stroke_points(ui, viewport);
                         let mut batch_source = input_batch.source;
+                        let mut batch_first_pressure_from_device =
+                            input_batch.first_pressure_from_device;
                         self.audit.raw_events = self.audit.raw_events.saturating_add(
                             u32::try_from(input_batch.points.len()).unwrap_or(u32::MAX),
                         );
@@ -2360,20 +2473,35 @@ impl eframe::App for CanvasApp {
                                 viewport,
                             ));
                             batch_source = StrokeInputSource::PointerFallback;
+                            batch_first_pressure_from_device = false;
                         }
 
-                        if let Some(first) = batch.first().copied()
-                            && self.should_reanchor_pointer_begin_to_touch(batch_source, first)
-                        {
-                            match self.reanchor_active_stroke_to_touch(first) {
-                                Ok(()) => {
-                                    batch.remove(0);
-                                }
-                                Err(error) => {
-                                    self.last_error = Some(error);
-                                    batch.clear();
+                        if let Some(first) = batch.first().copied() {
+                            let should_reanchor = self
+                                .should_reanchor_pointer_begin_to_touch(batch_source, first)
+                                || self.should_reanchor_touch_begin_pressure(
+                                    batch_source,
+                                    batch_first_pressure_from_device,
+                                );
+                            if should_reanchor {
+                                match self.reanchor_active_stroke_to_touch(
+                                    first,
+                                    batch_first_pressure_from_device,
+                                ) {
+                                    Ok(()) => {
+                                        batch.remove(0);
+                                    }
+                                    Err(error) => {
+                                        self.last_error = Some(error);
+                                        batch.clear();
+                                    }
                                 }
                             }
+                        }
+
+                        self.update_tap_candidate(&batch);
+                        if self.batch_is_tap_jitter(batch_source, &batch) {
+                            batch.clear();
                         }
 
                         if let Some(id) = self.active_stroke
@@ -2400,6 +2528,7 @@ impl eframe::App for CanvasApp {
                                         dispatch.last_brush_dispatches;
                                     if dispatch.last_brush_dispatches > 0 {
                                         self.active_stroke_dispatched = true;
+                                        self.active_tap_candidate = None;
                                     }
                                     self.last_error = None;
                                 }
@@ -2435,13 +2564,42 @@ impl eframe::App for CanvasApp {
                 match self.tool_mode {
                     ToolMode::Brush => {
                         if let Some(id) = self.active_stroke.take() {
-                            self.active_stroke_input_source = None;
-                            self.active_stroke_dispatched = false;
+                            let was_dispatched = self.active_stroke_dispatched;
+                            let tap_candidate =
+                                self.active_tap_candidate.take().filter(|candidate| {
+                                    candidate.max_distance
+                                        <= tap_jitter_threshold(self.brush_radius)
+                                });
+                            let tap_command = (!was_dispatched)
+                                .then(|| {
+                                    tap_candidate.map(|candidate| {
+                                        let mut point = candidate.anchor;
+                                        point.pressure = candidate.max_pressure.clamp(0.0, 1.0);
+                                        CanvasCommand::Brush(BrushCommand {
+                                            layer: self.layer_id,
+                                            mode: self.brush_mode,
+                                            points: vec![point],
+                                            radius: self.brush_radius,
+                                            color: self.color(),
+                                        })
+                                    })
+                                })
+                                .flatten();
+                            self.reset_active_stroke_tracking();
                             let mut core = self.core.lock().unwrap();
-                            match core
-                                .execute(&CanvasCommand::EndStroke(id))
-                                .and_then(|_| Self::refresh(&mut core))
-                            {
+                            let result =
+                                core.execute(&CanvasCommand::EndStroke(id))
+                                    .and_then(|output| {
+                                        let committed = matches!(
+                                            output,
+                                            CommandOutput::StrokeEnded { committed: true }
+                                        );
+                                        if !committed && let Some(command) = &tap_command {
+                                            core.execute(command)?;
+                                        }
+                                        Self::refresh(&mut core)
+                                    });
+                            match result {
                                 Ok(()) => self.last_error = None,
                                 Err(error) => self.last_error = Some(error.to_string()),
                             }
@@ -3126,6 +3284,71 @@ mod tests {
             },
             15.0,
         ));
+    }
+
+    #[test]
+    fn input_layer_reanchors_touch_begin_when_first_pressure_arrives() {
+        assert!(should_reanchor_touch_begin_pressure(
+            StrokeInputSource::Touch,
+            Some(StrokeInputSource::Touch),
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_reanchor_touch_begin_pressure(
+            StrokeInputSource::Touch,
+            Some(StrokeInputSource::Touch),
+            true,
+            false,
+            true,
+        ));
+        assert!(!should_reanchor_touch_begin_pressure(
+            StrokeInputSource::Touch,
+            Some(StrokeInputSource::Touch),
+            false,
+            true,
+            true,
+        ));
+        assert!(!should_reanchor_touch_begin_pressure(
+            StrokeInputSource::Touch,
+            Some(StrokeInputSource::Touch),
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn input_layer_treats_subpixel_touch_moves_as_tap_jitter() {
+        let candidate = TapCandidate {
+            anchor: StrokePoint {
+                x: 549.76,
+                y: 652.01,
+                pressure: 0.017,
+            },
+            max_pressure: 0.323,
+            max_distance: 2.86,
+        };
+        let jitter = [
+            StrokePoint {
+                x: 550.66,
+                y: 649.52,
+                pressure: 0.323,
+            },
+            StrokePoint {
+                x: 550.73,
+                y: 649.32,
+                pressure: 0.323,
+            },
+        ];
+        assert!(points_within_tap_jitter(candidate, &jitter, 15.0));
+
+        let moved = [StrokePoint {
+            x: 555.76,
+            y: 652.01,
+            pressure: 0.323,
+        }];
+        assert!(!points_within_tap_jitter(candidate, &moved, 15.0));
     }
 
     #[test]
