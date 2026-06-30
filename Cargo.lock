@@ -565,9 +565,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "canva-input"
+version = "0.1.0"
+dependencies = [
+ "canvas_core",
+]
+
+[[package]]
 name = "canva-test"
 version = "0.1.0"
 dependencies = [
+ "canva-input",
  "canvas_core",
  "eframe",
  "egui",

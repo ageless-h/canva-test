@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 canvas_core = { path = "../canva" }
+canva_input = { package = "canva-input", path = "../oani-input", features = ["canva"] }
 eframe = { version = "0.34", features = ["wgpu"] }
 egui = "0.34"
 pollster = "0.4"
