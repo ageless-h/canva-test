@@ -569,6 +569,7 @@ name = "canva-input"
 version = "0.1.0"
 dependencies = [
  "canvas_core",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -580,6 +581,7 @@ dependencies = [
  "eframe",
  "egui",
  "pollster",
+ "raw-window-handle",
 ]
 
 [[package]]

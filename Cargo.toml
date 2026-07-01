@@ -9,6 +9,7 @@ canva_input = { package = "canva-input", path = "../oani-input", features = ["ca
 eframe = { version = "0.34", features = ["wgpu"] }
 egui = "0.34"
 pollster = "0.4"
+raw-window-handle = "0.6.2"
 
 [lints.rust]
 unsafe_code = "warn"
