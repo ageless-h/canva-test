@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use canva_input::platform::macos::MacosAppKitCapture;
 #[cfg(target_os = "windows")]
 use canva_input::platform::windows::WindowsPointerCapture;
 use canva_input::{
@@ -22,8 +24,12 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_STABILIZER_ENABLED: bool = false;
 const DEFAULT_STABILIZER_SMOOTH_STRENGTH: f32 = 0.0;
-const RAW_LEAD_POINT_LIMIT: usize = 96;
-const RAW_LEAD_SEGMENT_LIMIT: usize = 48;
+const RAW_LEAD_POINT_LIMIT: usize = 2048;
+const RAW_LEAD_SEGMENT_LIMIT: usize = 512;
+const MACOS_NATIVE_DRAIN_LIMIT: usize = 32;
+const NATIVE_INPUT_REPAINT_INTERVAL: Duration = Duration::from_millis(8);
+const STREAM_PRESENT_INTERVAL: Duration = Duration::from_millis(16);
+const NATIVE_CONTACT_PRESSURE_EPSILON: f32 = 0.02;
 
 fn main() -> eframe::Result<()> {
     let config = CanvasConfig {
@@ -40,6 +46,7 @@ fn main() -> eframe::Result<()> {
             min_samples: 2,
         },
         data_capture: initial_capture_config(),
+        gpu_timestamps: false,
         ..CanvasConfig::default()
     };
 
@@ -204,6 +211,14 @@ struct StrokeAudit {
     max_native_batch_gap: f32,
     native_pointer_dropped: u64,
     native_pointer_last_error: Option<u32>,
+    native_send_event_events: u64,
+    native_candidate_events: u64,
+    native_tablet_events: u64,
+    native_accepted_events: u64,
+    native_rejected_plain_events: u64,
+    native_rejected_device_type_events: u64,
+    native_last_event_type: Option<usize>,
+    native_last_event_subtype: Option<i16>,
     begin_point: Option<StrokePoint>,
     begin_pressure_from_device: bool,
     begin_input_source: Option<StrokeInputSource>,
@@ -214,6 +229,8 @@ struct StrokeAudit {
     last_append_second: Option<StrokePoint>,
     last_core_uploaded_points: usize,
     last_core_dispatches: usize,
+    total_core_uploaded_points: usize,
+    total_core_dispatches: usize,
     raw_pts: Vec<StrokePoint>,
 }
 
@@ -340,6 +357,8 @@ struct CanvasApp {
     canvas_width: f32,
     canvas_height: f32,
     active_stroke: Option<StrokeId>,
+    last_core_stroke_point: Option<StrokePoint>,
+    last_stream_present: Instant,
     input_session: StrokeInputSession,
     stabilizer_enabled: bool,
     smooth_strength: f32,
@@ -353,6 +372,8 @@ struct CanvasApp {
     next_latency_sample_id: u64,
     #[cfg(target_os = "windows")]
     native_pointer_capture: Option<WindowsPointerCapture>,
+    #[cfg(target_os = "macos")]
+    native_pointer_capture: Option<MacosAppKitCapture>,
     native_pointer_status: String,
     prediction: bool,
     raw_lead_preview: bool,
@@ -444,9 +465,31 @@ fn native_phase_stops_active_stroke(phase: StylusPhase) -> bool {
     matches!(phase, StylusPhase::Up | StylusPhase::Cancel)
 }
 
+fn native_input_has_draw_contact(input: &NativeInputPoint) -> bool {
+    if !input.point.pressure_from_device {
+        return true;
+    }
+    input.point.point.pressure > NATIVE_CONTACT_PRESSURE_EPSILON
+}
+
+fn active_interaction_stopped(
+    tool_mode: ToolMode,
+    active_native_source: Option<StrokeInputSource>,
+    egui_stopped: bool,
+    native_stopped: bool,
+) -> bool {
+    match tool_mode {
+        ToolMode::Brush if active_native_source.is_some() => native_stopped,
+        ToolMode::Brush | ToolMode::RectSelection | ToolMode::LassoSelection => {
+            egui_stopped || native_stopped
+        }
+    }
+}
+
 fn input_source_label(source: Option<StrokeInputSource>) -> &'static str {
     match source {
         Some(StrokeInputSource::Touch) => "touch",
+        Some(StrokeInputSource::MacosAppKit) => "macos appkit",
         Some(StrokeInputSource::WindowsPointer) => "windows pointer",
         Some(StrokeInputSource::PointerFallback) => "pointer fallback",
         None => "-",
@@ -475,7 +518,29 @@ fn install_native_pointer_capture(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn install_native_pointer_capture(
+    cc: &eframe::CreationContext<'_>,
+) -> (Option<MacosAppKitCapture>, String) {
+    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+
+    let handle = match cc.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::AppKit(handle)) => handle,
+        Ok(_) => return (None, "unsupported window handle".to_owned()),
+        Err(error) => return (None, format!("window handle unavailable: {error}")),
+    };
+
+    let ns_view = handle.ns_view.as_ptr();
+    // Safety: eframe creates the NSView on the GUI thread before app construction.
+    // The returned guard removes its AppKit monitor before the app is destroyed.
+    match unsafe { MacosAppKitCapture::install_for_ns_view(ns_view) } {
+        Ok(capture) => (Some(capture), "installed".to_owned()),
+        Err(error) => (None, error.to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn install_native_pointer_capture(_cc: &eframe::CreationContext<'_>) -> String {
     "unsupported platform".to_owned()
 }
@@ -496,8 +561,92 @@ fn stroke_point_from_input(point: StrokeInputPoint) -> StrokePoint {
     point.point.into()
 }
 
+fn stroke_input_point_distance(a: StrokeInputPoint, b: StrokeInputPoint) -> f32 {
+    let a = stroke_point_from_input(a);
+    let b = stroke_point_from_input(b);
+    stroke_point_distance(a, b)
+}
+
+fn stroke_point_distance(a: StrokePoint, b: StrokePoint) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
+}
+
 fn stroke_points_from_input(points: Vec<StrokeInputPoint>) -> Vec<StrokePoint> {
     points.into_iter().map(stroke_point_from_input).collect()
+}
+
+fn densify_max_gap(source: Option<StrokeInputSource>, brush_radius: f32) -> f32 {
+    match source {
+        Some(StrokeInputSource::MacosAppKit | StrokeInputSource::WindowsPointer) => {
+            (brush_radius * 2.0).clamp(20.0, 48.0)
+        }
+        _ => (brush_radius * 0.35).clamp(2.5, 8.0),
+    }
+}
+
+fn densify_stroke_points(
+    points: Vec<StrokePoint>,
+    brush_radius: f32,
+    source: Option<StrokeInputSource>,
+) -> Vec<StrokePoint> {
+    if points.len() < 2 {
+        return points;
+    }
+
+    let max_gap = densify_max_gap(source, brush_radius);
+    let mut densified = Vec::with_capacity(points.len());
+    densified.push(points[0]);
+
+    for window in points.windows(2) {
+        let from = window[0];
+        let to = window[1];
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let steps = (distance / max_gap).ceil().clamp(1.0, 128.0) as usize;
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            densified.push(StrokePoint {
+                x: from.x + dx * t,
+                y: from.y + dy * t,
+                pressure: from.pressure + (to.pressure - from.pressure) * t,
+            });
+        }
+    }
+
+    densified
+}
+
+#[cfg(test)]
+fn stroke_points_from_input_densified(
+    points: Vec<StrokeInputPoint>,
+    brush_radius: f32,
+) -> Vec<StrokePoint> {
+    let source = points.first().map(|point| point.source);
+    densify_stroke_points(stroke_points_from_input(points), brush_radius, source)
+}
+
+fn stroke_points_from_input_densified_after(
+    previous: Option<StrokePoint>,
+    points: Vec<StrokeInputPoint>,
+    brush_radius: f32,
+) -> Vec<StrokePoint> {
+    let source = points.first().map(|point| point.source);
+    let mut points = stroke_points_from_input(points);
+    let Some(previous) = previous else {
+        return densify_stroke_points(points, brush_radius, source);
+    };
+    if points.is_empty() {
+        return points;
+    }
+    points.insert(0, previous);
+    let mut densified = densify_stroke_points(points, brush_radius, source);
+    if !densified.is_empty() {
+        densified.remove(0);
+    }
+    densified
 }
 
 fn optional_f32_debug(value: Option<f32>) -> String {
@@ -555,6 +704,24 @@ fn raw_lead_tail_start(points: &[StrokePoint], core_tip: Option<StrokePoint>) ->
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map_or(floor, |(index, _)| index.saturating_sub(1).max(floor))
+}
+
+fn draw_round_preview_stroke(
+    painter: &egui::Painter,
+    points: &[egui::Pos2],
+    width: f32,
+    color: egui::Color32,
+) {
+    let radius = (width * 0.5).max(0.5);
+    if points.len() >= 2 {
+        painter.add(egui::Shape::line(
+            points.to_vec(),
+            egui::Stroke::new(width, color),
+        ));
+    }
+    for point in points {
+        painter.circle_filled(*point, radius, color);
+    }
 }
 
 fn duration_ms(duration: Duration) -> f32 {
@@ -839,9 +1006,9 @@ impl CanvasApp {
         );
 
         let trace_base_layers = core.lock().unwrap().layer_snapshot();
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let (native_pointer_capture, native_pointer_status) = install_native_pointer_capture(cc);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let native_pointer_status = install_native_pointer_capture(cc);
 
         Self {
@@ -853,6 +1020,8 @@ impl CanvasApp {
             canvas_width: 1024.0,
             canvas_height: 1024.0,
             active_stroke: None,
+            last_core_stroke_point: None,
+            last_stream_present: Instant::now(),
             input_session: StrokeInputSession::new(15.0),
             stabilizer_enabled: DEFAULT_STABILIZER_ENABLED,
             smooth_strength: DEFAULT_STABILIZER_SMOOTH_STRENGTH,
@@ -863,7 +1032,7 @@ impl CanvasApp {
             raw_lead_points: Vec::new(),
             latency_probe: None,
             next_latency_sample_id: 1,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             native_pointer_capture,
             native_pointer_status,
             prediction: false,
@@ -946,6 +1115,18 @@ impl CanvasApp {
     fn refresh(core: &mut CanvasCore) -> Result<(), canvas_core::CanvasError> {
         core.composite()?;
         core.present()
+    }
+
+    fn refresh_streaming_if_due(
+        core: &mut CanvasCore,
+        last_stream_present: &mut Instant,
+    ) -> Result<bool, canvas_core::CanvasError> {
+        if last_stream_present.elapsed() < STREAM_PRESENT_INTERVAL {
+            return Ok(false);
+        }
+        Self::refresh(core)?;
+        *last_stream_present = Instant::now();
+        Ok(true)
     }
 
     fn layers(&self) -> Vec<LayerSnapshot> {
@@ -1313,12 +1494,13 @@ impl CanvasApp {
         sample.y = canvas_point.y;
         let pressure_from_device = finite_pressure(sample.pressure).is_some();
         let adapted = self.adapt_stylus_sample(sample);
+        let source = match event.sample.backend {
+            InputBackend::MacosAppKit => StrokeInputSource::MacosAppKit,
+            InputBackend::WindowsPointer => StrokeInputSource::WindowsPointer,
+            _ => StrokeInputSource::PointerFallback,
+        };
         NativeInputPoint {
-            point: StrokeInputPoint::new(
-                adapted,
-                StrokeInputSource::WindowsPointer,
-                pressure_from_device,
-            ),
+            point: StrokeInputPoint::new(adapted, source, pressure_from_device),
             phase,
             window_pos,
         }
@@ -1340,6 +1522,14 @@ impl CanvasApp {
             let stats = capture.stats();
             self.audit.native_pointer_dropped = stats.dropped_events;
             self.audit.native_pointer_last_error = stats.last_error;
+            self.audit.native_send_event_events = stats.send_event_events;
+            self.audit.native_candidate_events = stats.candidate_events;
+            self.audit.native_tablet_events = stats.tablet_events;
+            self.audit.native_accepted_events = stats.accepted_events;
+            self.audit.native_rejected_plain_events = stats.rejected_plain_events;
+            self.audit.native_rejected_device_type_events = stats.rejected_device_type_events;
+            self.audit.native_last_event_type = stats.last_event_type;
+            self.audit.native_last_event_subtype = stats.last_event_subtype;
         }
         self.audit.last_native_pointer_batch = events.len();
         self.audit.native_pointer_events = self
@@ -1358,7 +1548,49 @@ impl CanvasApp {
         points
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    fn drain_native_pointer_input(
+        &mut self,
+        _ui: &egui::Ui,
+        viewport: CanvasViewport,
+        _frame_time_seconds: f64,
+    ) -> Vec<NativeInputPoint> {
+        let events = self
+            .native_pointer_capture
+            .as_ref()
+            .map(|capture| capture.drain_events_limit(MACOS_NATIVE_DRAIN_LIMIT))
+            .unwrap_or_default();
+        if let Some(capture) = &self.native_pointer_capture {
+            let stats = capture.stats();
+            self.audit.native_pointer_dropped = stats.dropped_events;
+            self.audit.native_pointer_last_error = stats.last_error;
+            self.audit.native_send_event_events = stats.send_event_events;
+            self.audit.native_candidate_events = stats.candidate_events;
+            self.audit.native_tablet_events = stats.tablet_events;
+            self.audit.native_accepted_events = stats.accepted_events;
+            self.audit.native_rejected_plain_events = stats.rejected_plain_events;
+            self.audit.native_rejected_device_type_events = stats.rejected_device_type_events;
+            self.audit.native_last_event_type = stats.last_event_type;
+            self.audit.native_last_event_subtype = stats.last_event_subtype;
+        }
+        self.audit.last_native_pointer_batch = events.len();
+        self.audit.native_pointer_events = self
+            .audit
+            .native_pointer_events
+            .saturating_add(u32::try_from(events.len()).unwrap_or(u32::MAX));
+        let points = events
+            .into_iter()
+            .filter(|event| event.sample.phase != StylusPhase::Hover)
+            .map(|event| self.native_backend_event_to_input_point(event, viewport))
+            .collect::<Vec<_>>();
+        self.audit.last_native_batch_max_gap = native_input_batch_max_gap(&points);
+        if self.audit.last_native_batch_max_gap > self.audit.max_native_batch_gap {
+            self.audit.max_native_batch_gap = self.audit.last_native_batch_max_gap;
+        }
+        points
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn drain_native_pointer_input(
         &mut self,
         _ui: &egui::Ui,
@@ -1401,6 +1633,15 @@ impl CanvasApp {
                 self.audit.max_input_latency_ms = source_timestamp_age_ms;
             }
         }
+    }
+
+    fn begin_latency_probe_for_core_append(
+        &mut self,
+        point: StrokeInputPoint,
+        frame_time_seconds: f64,
+    ) {
+        let source_timestamp_age_ms =
+            input_latency_ms(point.point.time_seconds, frame_time_seconds);
         let sample_id = self.next_latency_sample_id;
         self.next_latency_sample_id = self.next_latency_sample_id.saturating_add(1);
         self.latency_probe = Some(InputLatencyProbe::new(
@@ -1465,7 +1706,10 @@ impl CanvasApp {
     }
 
     fn mark_latest_latency_paint(&mut self) {
-        if let Some(mut probe) = self.latency_probe {
+        if let Some(mut probe) = self.latency_probe
+            && probe.paint.is_none()
+            && probe.core_append_done.is_some()
+        {
             probe.paint = Some(Instant::now());
             self.latency_probe = Some(probe);
             self.update_latency_report();
@@ -1682,6 +1926,8 @@ impl CanvasApp {
         match output {
             CommandOutput::StrokeStarted { id } => {
                 self.active_stroke = Some(id);
+                self.last_core_stroke_point = Some(first_point);
+                self.last_stream_present = Instant::now();
                 self.audit.begin_point = Some(first_point);
                 self.audit.begin_pressure_from_device = first.pressure_from_device;
                 self.audit.begin_input_source = Some(StrokeInputSource::Touch);
@@ -1695,6 +1941,7 @@ impl CanvasApp {
 
     fn reset_active_stroke_tracking(&mut self) {
         self.input_session.reset();
+        self.last_core_stroke_point = None;
         self.latest_input_preview = None;
         self.raw_lead_points.clear();
         self.latency_probe = None;
@@ -2398,6 +2645,19 @@ impl eframe::App for CanvasApp {
                     a.native_pointer_last_error
                         .map_or_else(|| "-".to_owned(), |error| error.to_string())
                 ));
+                ui.label(format!(
+                    "native tap: send={} cand={} tablet={} accepted={} plain_reject={} device_reject={} last={}/{}",
+                    a.native_send_event_events,
+                    a.native_candidate_events,
+                    a.native_tablet_events,
+                    a.native_accepted_events,
+                    a.native_rejected_plain_events,
+                    a.native_rejected_device_type_events,
+                    a.native_last_event_type
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                    a.native_last_event_subtype
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string())
+                ));
                 ui.label(format!("帧数: {}", a.frames));
                 ui.label(format!("原始事件: {}", a.raw_events));
                 ui.label(format!("每帧事件: {rate:.2}"));
@@ -2493,8 +2753,11 @@ impl eframe::App for CanvasApp {
                     stroke_point_debug(a.last_append_second)
                 ));
                 ui.label(format!(
-                    "core upload/dispatch: {}/{}",
-                    a.last_core_uploaded_points, a.last_core_dispatches
+                    "core upload/dispatch: {}/{} total {}/{}",
+                    a.last_core_uploaded_points,
+                    a.last_core_dispatches,
+                    a.total_core_uploaded_points,
+                    a.total_core_dispatches
                 ));
                 ui.label("红色 = 原始输入点");
 
@@ -2626,19 +2889,32 @@ impl eframe::App for CanvasApp {
             let frame_time_seconds = ui.input(|i| i.time);
             let native_input_points =
                 self.drain_native_pointer_input(ui, viewport, frame_time_seconds);
+            let active_native_source_before_frame =
+                self.input_session.active_source().filter(|source| {
+                    matches!(
+                        source,
+                        StrokeInputSource::MacosAppKit | StrokeInputSource::WindowsPointer
+                    )
+                });
             let native_begin_index = native_input_points.iter().position(|input| {
-                native_phase_can_begin_stroke(input.phase) && rect.contains(input.window_pos)
+                active_native_source_before_frame.is_none()
+                    && native_phase_can_begin_stroke(input.phase)
+                    && native_input_has_draw_contact(input)
+                    && rect.contains(input.window_pos)
             });
             let native_begin_input = native_begin_index.map(|index| native_input_points[index]);
-            let native_stopped = native_input_points
-                .iter()
-                .any(|input| native_phase_stops_active_stroke(input.phase));
-            let native_update_points = native_input_points
+            let native_stopped = native_input_points.iter().any(|input| {
+                active_native_source_before_frame.is_some()
+                    && native_phase_stops_active_stroke(input.phase)
+            });
+            let mut native_update_points = native_input_points
                 .iter()
                 .enumerate()
                 .filter(|(index, input)| {
                     Some(*index) != native_begin_index
                         && native_phase_appends_to_active_stroke(input.phase)
+                        && native_input_has_draw_contact(input)
+                        && rect.contains(input.window_pos)
                 })
                 .map(|(_, input)| input.point)
                 .collect::<Vec<_>>();
@@ -2652,7 +2928,7 @@ impl eframe::App for CanvasApp {
                 self.audit.last_native_pointer_batch = native_input_points.len();
                 self.audit.native_pointer_events =
                     u32::try_from(native_input_points.len()).unwrap_or(u32::MAX);
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 if let Some(capture) = &self.native_pointer_capture {
                     let stats = capture.stats();
                     self.audit.native_pointer_dropped = stats.dropped_events;
@@ -2691,6 +2967,8 @@ impl eframe::App for CanvasApp {
                             match output {
                                 Ok(CommandOutput::StrokeStarted { id }) => {
                                     self.active_stroke = Some(id);
+                                    self.last_core_stroke_point = Some(p);
+                                    self.last_stream_present = Instant::now();
                                     self.input_session.begin(input);
                                     self.last_error = None;
                                 }
@@ -2721,6 +2999,55 @@ impl eframe::App for CanvasApp {
                         }
                     }
                 }
+            }
+
+            let active_native_source = self.input_session.active_source().filter(|source| {
+                matches!(
+                    source,
+                    StrokeInputSource::MacosAppKit | StrokeInputSource::WindowsPointer
+                )
+            });
+            if !primary_drag_started
+                && !native_stopped
+                && native_update_points.is_empty()
+                && self.active_stroke.is_some()
+                && let Some(source) = active_native_source
+                && let Some(pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.input(|input| input.pointer.hover_pos()))
+                    .filter(|pos| rect.contains(*pos))
+            {
+                let supplemental = self.input_stroke_point(
+                    pos,
+                    viewport,
+                    InputSampleContext {
+                        phase: StylusPhase::Move,
+                        force: Some(self.last_pressure),
+                        time_seconds: frame_time_seconds,
+                        batch_size: 1,
+                        source,
+                    },
+                );
+                let min_gap = (self.brush_radius * 0.25).clamp(2.0, 6.0);
+                let supplemental_point = stroke_point_from_input(supplemental);
+                let should_append = if let Some(last) = native_update_points.last().copied() {
+                    stroke_input_point_distance(last, supplemental) >= min_gap
+                } else {
+                    self.last_core_stroke_point.is_none_or(|last| {
+                        stroke_point_distance(last, supplemental_point) >= min_gap
+                    })
+                };
+                if should_append {
+                    native_update_points.push(supplemental);
+                }
+            }
+
+            if !native_stopped
+                && (!native_input_points.is_empty()
+                    || (self.active_stroke.is_some() && active_native_source.is_some()))
+            {
+                ui.ctx()
+                    .request_repaint_after(NATIVE_INPUT_REPAINT_INTERVAL);
             }
 
             // Stroke update: collect high-rate input events and feed the streaming API.
@@ -2754,10 +3081,10 @@ impl eframe::App for CanvasApp {
                             self.input_stroke_points(ui, viewport)
                         } else {
                             self.record_adapted_pressure_range(&native_update_points);
-                            StrokeInputBatch::new(
-                                StrokeInputSource::WindowsPointer,
-                                native_update_points.clone(),
-                            )
+                            let native_source = native_update_points
+                                .first()
+                                .map_or(StrokeInputSource::PointerFallback, |point| point.source);
+                            StrokeInputBatch::new(native_source, native_update_points.clone())
                         };
                         self.record_input_batch_timestamp_ages(
                             &input_batch.points,
@@ -2796,8 +3123,11 @@ impl eframe::App for CanvasApp {
                             );
                         }
 
+                        let append_uses_native_preview = matches!(
+                            input_batch.source,
+                            StrokeInputSource::MacosAppKit | StrokeInputSource::WindowsPointer
+                        );
                         let append = self.input_session.append_batch(input_batch);
-                        self.mark_latest_latency_session_emit();
                         let mut batch = append.points;
                         if let Some(first) = append.reanchor
                             && let Err(error) = self.reanchor_active_stroke_to_touch(first)
@@ -2809,20 +3139,39 @@ impl eframe::App for CanvasApp {
                         if let Some(id) = self.active_stroke
                             && !batch.is_empty()
                         {
-                            let batch = stroke_points_from_input(batch);
+                            if let Some(sample) = batch.last().copied() {
+                                self.begin_latency_probe_for_core_append(
+                                    sample,
+                                    frame_time_seconds,
+                                );
+                            }
+                            self.mark_latest_latency_session_emit();
+                            let batch = stroke_points_from_input_densified_after(
+                                self.last_core_stroke_point,
+                                batch,
+                                self.brush_radius,
+                            );
                             self.audit.append_batches = self.audit.append_batches.saturating_add(1);
                             self.audit.last_append_len = batch.len();
                             self.audit.last_append_first = batch.first().copied();
                             self.audit.last_append_second = batch.get(1).copied();
+                            let batch_last = batch.last().copied();
                             let core_append_start = Instant::now();
                             let mut core = self.core.lock().unwrap();
                             let command = CanvasCommand::AppendStroke(AppendStrokeCommand {
                                 stroke: id,
                                 points: batch,
                             });
-                            let result = core
-                                .execute(&command)
-                                .and_then(|_| Self::refresh(&mut core));
+                            let result = core.execute(&command).and_then(|_| {
+                                let refreshed = Self::refresh_streaming_if_due(
+                                    &mut core,
+                                    &mut self.last_stream_present,
+                                )?;
+                                if append_uses_native_preview && refreshed {
+                                    self.raw_lead_points.clear();
+                                }
+                                Ok(())
+                            });
                             let dispatch = result.as_ref().ok().map(|()| core.dispatch_report());
                             drop(core);
                             let core_append_done = Instant::now();
@@ -2833,10 +3182,19 @@ impl eframe::App for CanvasApp {
                             match result {
                                 Ok(()) => {
                                     let dispatch = dispatch.expect("dispatch report after success");
+                                    self.last_core_stroke_point = batch_last;
                                     self.audit.last_core_uploaded_points =
                                         dispatch.last_brush_uploaded_points;
                                     self.audit.last_core_dispatches =
                                         dispatch.last_brush_dispatches;
+                                    self.audit.total_core_uploaded_points = self
+                                        .audit
+                                        .total_core_uploaded_points
+                                        .saturating_add(dispatch.last_brush_uploaded_points);
+                                    self.audit.total_core_dispatches = self
+                                        .audit
+                                        .total_core_dispatches
+                                        .saturating_add(dispatch.last_brush_dispatches);
                                     if dispatch.last_brush_dispatches > 0 {
                                         self.input_session.mark_core_dispatched();
                                     }
@@ -2872,10 +3230,16 @@ impl eframe::App for CanvasApp {
             }
 
             // Stroke/selection end.
-            if response.drag_stopped() || native_stopped {
+            if active_interaction_stopped(
+                self.tool_mode,
+                active_native_source,
+                response.drag_stopped(),
+                native_stopped,
+            ) {
                 match self.tool_mode {
                     ToolMode::Brush => {
                         if let Some(id) = self.active_stroke.take() {
+                            self.last_core_stroke_point = None;
                             let tap_command = self.input_session.end().tap.map(|tap| {
                                 CanvasCommand::Brush(BrushCommand {
                                     layer: self.layer_id,
@@ -2899,7 +3263,9 @@ impl eframe::App for CanvasApp {
                                         Self::refresh(&mut core)
                                     });
                             match result {
-                                Ok(()) => self.last_error = None,
+                                Ok(()) => {
+                                    self.last_error = None;
+                                }
                                 Err(error) => self.last_error = Some(error.to_string()),
                             }
                         }
@@ -3015,14 +3381,18 @@ impl eframe::App for CanvasApp {
                 && let Some(id) = self.active_stroke
                 && !self.raw_lead_points.is_empty()
             {
-                self.mark_latest_latency_paint();
-                let core_tip = self.core.lock().unwrap().active_stroke_tip(id);
+                let core_tip = if active_native_source.is_some() {
+                    None
+                } else {
+                    self.core.lock().unwrap().active_stroke_tip(id)
+                };
                 let raw_tip = self.raw_lead_points.last().copied();
-                let draw_tail = core_tip.zip(raw_tip).is_none_or(|(core_tip, raw_tip)| {
-                    let dx = core_tip.x - raw_tip.x;
-                    let dy = core_tip.y - raw_tip.y;
-                    dx * dx + dy * dy > 0.25
-                });
+                let draw_tail = active_native_source.is_some()
+                    || core_tip.zip(raw_tip).is_none_or(|(core_tip, raw_tip)| {
+                        let dx = core_tip.x - raw_tip.x;
+                        let dy = core_tip.y - raw_tip.y;
+                        dx * dx + dy * dy > 0.25
+                    });
                 if draw_tail {
                     let tail_start = raw_lead_tail_start(&self.raw_lead_points, core_tip);
                     let tail = &self.raw_lead_points[tail_start..];
@@ -3033,26 +3403,47 @@ impl eframe::App for CanvasApp {
                         )
                     };
                     let painter = ui.painter_at(rect);
-                    let preview_color = egui::Color32::from_rgba_unmultiplied(30, 160, 240, 170);
+                    let preview_color = if active_native_source.is_some() {
+                        egui::Color32::from(egui::Rgba::from_rgba_unmultiplied(
+                            self.brush_color[0],
+                            self.brush_color[1],
+                            self.brush_color[2],
+                            (self.brush_color[3] * 0.78).clamp(0.0, 1.0),
+                        ))
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(30, 160, 240, 170)
+                    };
                     let tail_points = tail
                         .iter()
                         .copied()
                         .map(to_screen)
                         .filter(|point| point.x.is_finite() && point.y.is_finite())
                         .collect::<Vec<_>>();
-                    if tail_points.len() >= 2 {
-                        painter.add(egui::Shape::line(
-                            tail_points.clone(),
-                            egui::Stroke::new(2.0, preview_color),
-                        ));
-                    }
-                    if let Some(raw_tip) = tail_points.last().copied() {
-                        let r = (self.brush_radius * display_scale).max(1.0);
-                        painter.circle_stroke(raw_tip, r, egui::Stroke::new(1.5, preview_color));
-                        painter.circle_filled(raw_tip, 3.0, preview_color);
+                    if active_native_source.is_some() {
+                        if let Some(raw_tip) = tail_points.last().copied() {
+                            let r = (self.brush_radius * display_scale).max(1.0);
+                            painter.circle_stroke(
+                                raw_tip,
+                                r,
+                                egui::Stroke::new(1.5, preview_color),
+                            );
+                            painter.circle_filled(raw_tip, 3.0, preview_color);
+                        }
+                    } else if tail_points.len() >= 2 {
+                        draw_round_preview_stroke(&painter, &tail_points, 2.0, preview_color);
+                        if let Some(raw_tip) = tail_points.last().copied() {
+                            let r = (self.brush_radius * display_scale).max(1.0);
+                            painter.circle_stroke(
+                                raw_tip,
+                                r,
+                                egui::Stroke::new(1.5, preview_color),
+                            );
+                            painter.circle_filled(raw_tip, 3.0, preview_color);
+                        }
                     }
                 }
             }
+            self.mark_latest_latency_paint();
 
             // Core prediction preview.
             if self.core_prediction
@@ -3279,10 +3670,11 @@ mod tests {
 
         assert!(!stabilizer.enabled);
         assert_eq!(stabilizer.mode, StabilizerMode::Adaptive);
-        assert_eq!(
-            stabilizer.smooth_strength,
-            DEFAULT_STABILIZER_SMOOTH_STRENGTH
+        assert!(
+            (stabilizer.smooth_strength - DEFAULT_STABILIZER_SMOOTH_STRENGTH).abs() <= f32::EPSILON
         );
+        assert!(NATIVE_INPUT_REPAINT_INTERVAL <= Duration::from_millis(8));
+        assert!(STREAM_PRESENT_INTERVAL <= Duration::from_millis(16));
     }
 
     #[test]
@@ -3692,6 +4084,69 @@ mod tests {
     }
 
     #[test]
+    fn native_zero_pressure_device_move_is_not_draw_contact() {
+        let zero_pressure = NativeInputPoint {
+            point: input_test_point(10.0, 20.0, 0.0, StrokeInputSource::MacosAppKit, true),
+            phase: StylusPhase::Move,
+            window_pos: egui::pos2(100.0, 100.0),
+        };
+        let fallback_pressure = NativeInputPoint {
+            point: input_test_point(10.0, 20.0, 0.0, StrokeInputSource::PointerFallback, false),
+            phase: StylusPhase::Move,
+            window_pos: egui::pos2(100.0, 100.0),
+        };
+        let real_pressure = NativeInputPoint {
+            point: input_test_point(
+                10.0,
+                20.0,
+                NATIVE_CONTACT_PRESSURE_EPSILON * 2.0,
+                StrokeInputSource::MacosAppKit,
+                true,
+            ),
+            phase: StylusPhase::Move,
+            window_pos: egui::pos2(100.0, 100.0),
+        };
+
+        assert!(!native_input_has_draw_contact(&zero_pressure));
+        assert!(native_input_has_draw_contact(&fallback_pressure));
+        assert!(native_input_has_draw_contact(&real_pressure));
+    }
+
+    #[test]
+    fn native_brush_waits_for_native_stop_before_ending() {
+        assert!(!active_interaction_stopped(
+            ToolMode::Brush,
+            Some(StrokeInputSource::MacosAppKit),
+            true,
+            false,
+        ));
+        assert!(active_interaction_stopped(
+            ToolMode::Brush,
+            Some(StrokeInputSource::MacosAppKit),
+            false,
+            true,
+        ));
+        assert!(active_interaction_stopped(
+            ToolMode::Brush,
+            Some(StrokeInputSource::WindowsPointer),
+            false,
+            true,
+        ));
+        assert!(active_interaction_stopped(
+            ToolMode::Brush,
+            None,
+            true,
+            false,
+        ));
+        assert!(active_interaction_stopped(
+            ToolMode::RectSelection,
+            Some(StrokeInputSource::MacosAppKit),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
     fn native_input_batch_gap_uses_canvas_points() {
         let points = vec![
             NativeInputPoint {
@@ -3707,6 +4162,73 @@ mod tests {
         ];
 
         assert!((native_input_batch_max_gap(&points) - 5.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn native_sparse_points_are_densified_before_core_append() {
+        let points = vec![
+            input_test_point(0.0, 0.0, 0.2, StrokeInputSource::MacosAppKit, true),
+            input_test_point(100.0, 0.0, 0.6, StrokeInputSource::MacosAppKit, true),
+        ];
+
+        let dense = stroke_points_from_input_densified(points, 15.0);
+
+        assert!(dense.len() > 2);
+        assert_eq!(
+            dense.first().copied(),
+            Some(StrokePoint {
+                x: 0.0,
+                y: 0.0,
+                pressure: 0.2
+            })
+        );
+        assert_eq!(
+            dense.last().copied(),
+            Some(StrokePoint {
+                x: 100.0,
+                y: 0.0,
+                pressure: 0.6
+            })
+        );
+        assert!(
+            dense
+                .windows(2)
+                .all(|pair| (pair[1].x - pair[0].x).abs() <= 30.0)
+        );
+    }
+
+    #[test]
+    fn native_single_append_point_is_densified_from_previous_core_point() {
+        let previous = StrokePoint {
+            x: 0.0,
+            y: 0.0,
+            pressure: 0.2,
+        };
+        let points = vec![input_test_point(
+            100.0,
+            0.0,
+            0.6,
+            StrokeInputSource::MacosAppKit,
+            true,
+        )];
+
+        let dense = stroke_points_from_input_densified_after(Some(previous), points, 15.0);
+
+        assert!(dense.len() > 1);
+        assert_ne!(dense.first().copied(), Some(previous));
+        assert_eq!(
+            dense.last().copied(),
+            Some(StrokePoint {
+                x: 100.0,
+                y: 0.0,
+                pressure: 0.6
+            })
+        );
+        assert!(
+            dense
+                .windows(2)
+                .all(|pair| (pair[1].x - pair[0].x).abs() <= 30.0)
+        );
     }
 
     #[test]
@@ -3891,7 +4413,7 @@ mod tests {
 
     #[test]
     fn raw_lead_tail_start_limits_preview_to_recent_points() {
-        let points = (0..80)
+        let points = (0..(RAW_LEAD_SEGMENT_LIMIT + 80))
             .map(|index| StrokePoint {
                 x: index as f32,
                 y: 0.0,
